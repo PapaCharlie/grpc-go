@@ -606,7 +606,7 @@ func RecvBufferPool(bufferPool SharedBufferPool) ServerOption {
 // later release.
 func ServerSendBufferPool(bufferPool SendBufferPool) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.sendBufferPool = NewSendBufferPool()
+		o.sendBufferPool = bufferPool
 	})
 }
 
