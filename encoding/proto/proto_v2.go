@@ -22,95 +22,55 @@ package proto
 
 import (
 	"fmt"
-	"sync"
 
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/protobuf/proto"
 )
 
 func init() {
-	encoding.RegisterCodecV2(&codecV2{
-		bufferPool: sync.Pool{New: func() any { return []byte(nil) }},
-	})
+	encoding.RegisterCodecV2(new(codecV2))
 }
 
 // codec is an experimental.CodecV2 implementation with protobuf. It is the
 // default codec for gRPC.
 type codecV2 struct {
-	bufferPool sync.Pool
 }
 
-func (c *codecV2) freeBuffer(buf []byte) {
-	c.bufferPool.Put(encoding.ClearBuffer(buf))
-}
-
-func (c *codecV2) newBuffer() []byte {
-	return c.bufferPool.Get().([]byte)
-}
-
-func (c *codecV2) Marshal(v any) (length int, out encoding.BufferSeq) {
+func (c *codecV2) Marshal(v any) *encoding.BufferSeq {
 	vv := messageV2Of(v)
 	if vv == nil {
-		return 0, func(yield func(*encoding.Buffer, error) bool) {
-			yield(nil, fmt.Errorf("failed to marshal, message is %T, want proto.Message", v))
-		}
+		return encoding.ErrBufferSeq(fmt.Errorf("proto: failed to marshal, message is %T, want proto.Message", v))
 	}
-	buf := c.newBuffer()
-	buf, err := proto.MarshalOptions{}.MarshalAppend(buf, vv)
-	return len(buf), func(yield func(*encoding.Buffer, error) bool) {
-		if err != nil {
-			yield(nil, err)
-		} else {
-			yield(encoding.BufferFor(buf, c.freeBuffer), nil)
-		}
+
+	buf := encoding.NewBuffer(proto.Size(vv))
+	data, err := proto.MarshalOptions{}.MarshalAppend(buf.Data()[:0], vv)
+	if err != nil {
+		buf.Free()
+		buf = nil
+	} else {
+		buf.SetData(data)
 	}
+
+	return encoding.OneElementSeq(len(data), buf, err)
 }
 
-func (c *codecV2) GetBuffer(length int) *encoding.Buffer {
-	buf := c.newBuffer()
-	if cap(buf) < length {
-		buf = make([]byte, length)
-	}
-	return encoding.BufferFor(buf, c.freeBuffer)
+func (c *codecV2) GetBuffer(length int) encoding.Buffer {
+	return encoding.NewBuffer(length)
 }
 
-func (c *codecV2) Unmarshal(v any, length int, in encoding.BufferSeq) (err error) {
+func (c *codecV2) Unmarshal(v any, data *encoding.BufferSeq) (err error) {
 	vv := messageV2Of(v)
 	if vv == nil {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	var out []byte
+	buf, err := encoding.FullRead(data, encoding.NewBuffer)
+	if err != nil {
+		return err
+	}
+	defer buf.Free()
 
-	in(func(buffer *encoding.Buffer, innerErr error) bool {
-		if innerErr != nil {
-			err = innerErr
-			return false
-		}
-		defer buffer.Free()
-
-		if out == nil {
-			// Avoid copying anything if all the necessary data is in the initial buffer
-			if len(buffer.Data) == length {
-				out = buffer.Data
-			} else {
-				out = c.newBuffer()
-			}
-		}
-
-		if len(out) < length {
-			out = append(out, buffer.Data...)
-		}
-
-		if len(out) == length {
-			err = proto.Unmarshal(buffer.Data, vv)
-			return false
-		} else {
-			return true
-		}
-	})
-
-	return err
+	return proto.Unmarshal(buf.Data(), vv)
 }
 
 func (c *codecV2) Name() string {

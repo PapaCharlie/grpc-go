@@ -41,6 +41,7 @@ import (
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/binarylog"
 	"google.golang.org/grpc/internal/channelz"
+	internalencoding "google.golang.org/grpc/internal/encoding"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/internal/transport"
@@ -145,7 +146,7 @@ type Server struct {
 
 type serverOptions struct {
 	creds                 credentials.TransportCredentials
-	codec                 baseCodec
+	codec                 internalencoding.BaseCodecV2
 	cp                    Compressor
 	dc                    Decompressor
 	unaryInt              UnaryServerInterceptor
@@ -313,7 +314,7 @@ func KeepaliveEnforcementPolicy(kep keepalive.EnforcementPolicy) ServerOption {
 // Will be supported throughout 1.x.
 func CustomCodec(codec Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = codec
+		o.codec = internalencoding.CodecV1Bridge{BaseCodec: codec}
 	})
 }
 
@@ -342,7 +343,7 @@ func CustomCodec(codec Codec) ServerOption {
 // later release.
 func ForceServerCodec(codec encoding.Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = codec
+		o.codec = internalencoding.CodecV1Bridge{BaseCodec: codec}
 	})
 }
 
@@ -1349,7 +1350,8 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 	df := func(v any) error {
 		defer cancel()
 
-		if err := s.getCodec(stream.ContentSubtype()).Unmarshal(d, v); err != nil {
+		codec := s.getCodec(stream.ContentSubtype())
+		if err := codec.Unmarshal(v, len(d), func(yield func([]byte, error) bool) { yield(d, nil) }); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
 		}
 		for _, sh := range shs {
@@ -1958,17 +1960,17 @@ func (s *Server) closeListenersLocked() {
 
 // contentSubtype must be lowercase
 // cannot return nil
-func (s *Server) getCodec(contentSubtype string) baseCodec {
+func (s *Server) getCodec(contentSubtype string) internalencoding.BaseCodecV2 {
 	if s.opts.codec != nil {
 		return s.opts.codec
 	}
 	if contentSubtype == "" {
-		return encoding.GetCodec(proto.Name)
+		return encoding.GetCodecV2(proto.Name)
 	}
-	codec := encoding.GetCodec(contentSubtype)
+	codec := internalencoding.GetCodec(contentSubtype)
 	if codec == nil {
 		logger.Warningf("Unsupported codec %q. Defaulting to %q for now. This will start to fail in future releases.", contentSubtype, proto.Name)
-		return encoding.GetCodec(proto.Name)
+		return encoding.GetCodecV2(proto.Name)
 	}
 	return codec
 }

@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/encoding/proto"
+	internalencoding "google.golang.org/grpc/internal/encoding"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -157,7 +158,7 @@ type callInfo struct {
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
 	contentSubtype        string
-	codec                 baseCodec
+	codec                 internalencoding.BaseCodecV2
 	maxRetryRPCBufferSize int
 	onFinish              []func(err error)
 }
@@ -515,7 +516,7 @@ type ForceCodecCallOption struct {
 }
 
 func (o ForceCodecCallOption) before(c *callInfo) error {
-	c.codec = o.Codec
+	c.codec = internalencoding.CodecV1Bridge{baseCodec: o.Codec}
 	return nil
 }
 func (o ForceCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -540,7 +541,7 @@ type CustomCodecCallOption struct {
 }
 
 func (o CustomCodecCallOption) before(c *callInfo) error {
-	c.codec = o.Codec
+	c.codec = internalencoding.CodecV1Bridge{o.Codec}
 	return nil
 }
 func (o CustomCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -640,16 +641,17 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c baseCodec, msg any) ([]byte, error) {
+func encode(c internalencoding.BaseCodecV2, msg any) ([]byte, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
-	b, err := c.Marshal(msg)
+	seq := c.Marshal(msg)
+	if uint(seq.Len) > math.MaxUint32 {
+		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", seq.Len)
+	}
+
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err.Error())
-	}
-	if uint(len(b)) > math.MaxUint32 {
-		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", len(b))
 	}
 	return b, nil
 }
@@ -829,14 +831,25 @@ func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize 
 // For the two compressor parameters, both should not be set, but if they are,
 // dc takes precedence over compressor.
 // TODO(dfawley): wrap the old compressor/decompressor using the new API?
-func recv(p *parser, c baseCodec, s *transport.Stream, dc Decompressor, m any, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor) error {
+func recv(
+	p *parser,
+	c internalencoding.BaseCodecV2,
+	s *transport.Stream,
+	dc Decompressor,
+	m any,
+	maxReceiveMessageSize int,
+	payInfo *payloadInfo,
+	compressor encoding.Compressor,
+) error {
 	buf, cancel, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor)
 	if err != nil {
 		return err
 	}
 	defer cancel()
 
-	if err := c.Unmarshal(buf, m); err != nil {
+	if err := c.Unmarshal(m, len(buf), func(yield func([]byte, error) bool) {
+		yield(buf, nil)
+	}); err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}
 	return nil
@@ -854,14 +867,14 @@ type rpcInfo struct {
 // pointers to codec, and compressors, then we can use preparedMsg for Async message prep
 // and reuse marshalled bytes
 type compressorInfo struct {
-	codec baseCodec
+	codec internalencoding.BaseCodecV2
 	cp    Compressor
 	comp  encoding.Compressor
 }
 
 type rpcInfoContextKey struct{}
 
-func newContextWithRPCInfo(ctx context.Context, failfast bool, codec baseCodec, cp Compressor, comp encoding.Compressor) context.Context {
+func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalencoding.BaseCodecV2, cp Compressor, comp encoding.Compressor) context.Context {
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{
@@ -950,12 +963,12 @@ func setCallInfoCodec(c *callInfo) error {
 
 	if c.contentSubtype == "" {
 		// No codec specified in CallOptions; use proto by default.
-		c.codec = encoding.GetCodec(proto.Name)
+		c.codec = encoding.GetCodecV2(proto.Name)
 		return nil
 	}
 
 	// c.contentSubtype is already lowercased in CallContentSubtype
-	c.codec = encoding.GetCodec(c.contentSubtype)
+	c.codec = internalencoding.GetCodec(c.contentSubtype)
 	if c.codec == nil {
 		return status.Errorf(codes.Internal, "no codec registered for content-subtype %s", c.contentSubtype)
 	}

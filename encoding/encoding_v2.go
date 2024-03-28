@@ -24,36 +24,6 @@ import (
 	"google.golang.org/grpc/internal/grpcutil"
 )
 
-type Buffer struct {
-	Data []byte
-	free func([]byte)
-}
-
-func BufferFor(buf []byte, free func([]byte)) *Buffer {
-	return &Buffer{Data: buf, free: free}
-}
-
-func ClearBuffer(buf []byte) []byte {
-	// TODO: replace with clear when go1.21 is supported
-	// clear(buf)
-	for i := range buf {
-		buf[i] = 0
-	}
-	buf = buf[:0]
-	return buf
-}
-
-func (b *Buffer) Free() {
-	if b.free != nil {
-		b.free(b.Data)
-	}
-}
-
-// BufferSeq is the equivalent of iter.Seq[*Buffer, error], but cannot be added
-// by directly referencing the new iter package since it is not yet supported in
-// all versions of go supported by grpc-go.
-type BufferSeq = func(yield func(*Buffer, error) bool)
-
 // CompressorV2 is used for compressing and decompressing when sending or
 // receiving messages.
 type CompressorV2 interface {
@@ -99,16 +69,16 @@ func GetCompressorV2(name string) CompressorV2 {
 // that implementations of this interface must be thread safe; a CodecV2's
 // methods can be called from concurrent goroutines.
 type CodecV2 interface {
-	Marshal(v any) (length int, out BufferSeq)
-	GetBuffer(length int) *Buffer
-	Unmarshal(v any, length int, in BufferSeq) error
+	Marshal(v any) *BufferSeq
+	GetBuffer(length int) Buffer
+	Unmarshal(v any, data *BufferSeq) error
 	// Name returns the name of the Codec implementation. The returned string
 	// will be used as part of content type in transmission.  The result must be
 	// static; the result cannot change between calls.
 	Name() string
 }
 
-var registeredCodecsV2 = make(map[string]CodecV2)
+var registeredV2Codecs = make(map[string]CodecV2)
 
 // RegisterCodecV2 registers the provided CodecV2 for use with all gRPC clients and
 // servers.
@@ -132,7 +102,7 @@ func RegisterCodecV2(codec CodecV2) {
 		panic("cannot register CodecV2 with empty string result for Name()")
 	}
 	contentSubtype := strings.ToLower(codec.Name())
-	registeredCodecsV2[contentSubtype] = codec
+	registeredV2Codecs[contentSubtype] = codec
 }
 
 // GetCodecV2 gets a registered CodecV2 by content-subtype, or nil if no CodecV2 is
@@ -140,5 +110,5 @@ func RegisterCodecV2(codec CodecV2) {
 //
 // The content-subtype is expected to be lowercase.
 func GetCodecV2(contentSubtype string) CodecV2 {
-	return registeredCodecsV2[contentSubtype]
+	return registeredV2Codecs[contentSubtype]
 }

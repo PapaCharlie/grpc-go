@@ -1,35 +1,9 @@
-/*
- *
- * Copyright 2017 gRPC authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
-
-// Package gzip implements and registers the gzip compressor
-// during the initialization.
-//
-// # Experimental
-//
-// Notice: This package is EXPERIMENTAL and may be changed or removed in a
-// later release.
 package gzip
 
 import (
 	"bytes"
 	"errors"
 	"io"
-	"sync"
 
 	"google.golang.org/grpc/encoding"
 )
@@ -37,40 +11,50 @@ import (
 var _ encoding.CompressorV2 = (*compressorV2)(nil)
 
 type compressorV2 struct {
-	c          *compressor
-	bufferPool sync.Pool
+	c *compressor
 }
 
 func (c *compressorV2) Name() string {
 	return Name
 }
 
-func (c *compressorV2) freeBuffer(buf []byte) {
-	c.bufferPool.Put(encoding.ClearBuffer(buf))
+type yieldingWriter struct {
+	yield func(encoding.Buffer, error) bool
 }
 
-func (c *compressorV2) newBuffer() *bytes.Buffer {
-	return bytes.NewBuffer(c.bufferPool.Get().([]byte))
+var errSeqStopped = errors.New("")
+
+func (s *yieldingWriter) Write(p []byte) (n int, err error) {
+	buf := encoding.NewBuffer(len(p))
+	copy(buf.Data(), p)
+	if !s.yield(buf, nil) {
+		return 0, errSeqStopped
+	}
+	return len(p), err
 }
 
 func (c *compressorV2) Compress(in encoding.BufferSeq) (out encoding.BufferSeq) {
-	return func(yield func(*encoding.Buffer, error) bool) {
-		in(func(in *encoding.Buffer, err error) bool {
+	return func(yield func(encoding.Buffer, error) bool) {
+		w, err := c.c.Compress(&yieldingWriter{yield})
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		closed := false
+		closeOnce := func() error {
+		}
+
+		in(func(in encoding.Buffer, err error) bool {
 			if err != nil {
 				return yield(nil, err)
 			}
 			defer in.Free()
 
-			buf := c.newBuffer()
-			w, err := c.c.Compress(buf)
+			_, err = w.Write(in.Data())
 			if err != nil {
-				return yield(nil, err)
-			}
-
-			_, err = w.Write(in.Data)
-			if err != nil {
-				c.freeBuffer(buf.Bytes())
-				return yield(nil, errors.Join(err, w.Close()))
+				if !errors.Is(err, errSeqStopped) {
+					return yield(nil, errors.Join(err, w.Close()))
+				}
 			}
 
 			err = w.Close()
@@ -85,8 +69,8 @@ func (c *compressorV2) Compress(in encoding.BufferSeq) (out encoding.BufferSeq) 
 }
 
 func (c *compressorV2) Decompress(in encoding.BufferSeq) (out encoding.BufferSeq) {
-	return func(yield func(*encoding.Buffer, error) bool) {
-		in(func(in *encoding.Buffer, err error) bool {
+	return func(yield func(encoding.Buffer, error) bool) {
+		in(func(in encoding.Buffer, err error) bool {
 			if err != nil {
 				return yield(nil, err)
 			}
