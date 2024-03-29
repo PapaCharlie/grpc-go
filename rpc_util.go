@@ -516,7 +516,7 @@ type ForceCodecCallOption struct {
 }
 
 func (o ForceCodecCallOption) before(c *callInfo) error {
-	c.codec = internalencoding.CodecV1Bridge{baseCodec: o.Codec}
+	c.codec = internalencoding.CodecV1Bridge{Codec: o.Codec}
 	return nil
 }
 func (o ForceCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -611,7 +611,11 @@ type parser struct {
 // No other error values or types must be returned, which also means
 // that the underlying io.Reader must not return an incompatible
 // error.
-func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byte, err error) {
+func (p *parser) recvMsg(
+	c internalencoding.BaseCodecV2,
+	dc internalencoding.BaseDecompressorV2,
+	maxReceiveMessageSize int,
+) (pf payloadFormat, msg *internalencoding.MaterializedBufferSeq, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -628,44 +632,71 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 	if int(length) > maxReceiveMessageSize {
 		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
 	}
-	msg = p.recvBufferPool.Get(int(length))
-	if _, err := p.r.Read(msg); err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return 0, nil, err
+
+	var provider encoding.BufferProvider
+	// Choose the appropriate BufferProvider based on whether the message was
+	// compressed. If the message wasn't compressed it's important to use the codec's
+	// buffer provider so the codec can maximize buffer reuse.
+	if pf == compressionMade {
+		provider = dc.GetBuffer
+	} else {
+		provider = c.GetBuffer
 	}
+
+	msg = new(internalencoding.MaterializedBufferSeq)
+	for msg.Len < int(length) {
+		// TODO(PapaCharlie): Make configurable? Is it even worth doing this here rather
+		// than reading the entire message into a single buffer?
+		const bufSize = 1 << 14
+		buf := provider(bufSize)
+
+		msg.Data = append(msg.Data, buf)
+
+		n, err := p.r.Read(buf.Data())
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+
+			msg.Free()
+
+			return 0, nil, err
+		}
+
+		msg.Len += n
+	}
+
 	return pf, msg, nil
 }
 
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c internalencoding.BaseCodecV2, msg any) ([]byte, error) {
+func encode(c internalencoding.BaseCodecV2, msg any) (*internalencoding.MaterializedBufferSeq, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
-	seq := c.Marshal(msg)
-	if uint(seq.Len) > math.MaxUint32 {
-		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", seq.Len)
+	length, seq := c.Marshal(msg)
+	if uint(length) > math.MaxUint32 {
+		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", length)
 	}
 
+	out, err := internalencoding.MaterializeBufferSeq(length, seq)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err.Error())
 	}
-	return b, nil
+
+	return out, nil
 }
 
 // compress returns the input bytes compressed by compressor or cp.
 // If both compressors are nil, or if the message has zero length, returns nil,
 // indicating no compression was done.
-//
-// TODO(dfawley): eliminate cp parameter by wrapping Compressor in an encoding.Compressor.
-func compress(in []byte, cp Compressor, compressor encoding.Compressor) ([]byte, error) {
-	if compressor == nil && cp == nil {
+func compress(in *internalencoding.MaterializedBufferSeq, cp internalencoding.BaseCompressorV2) (*internalencoding.MaterializedBufferSeq, error) {
+	if cp == nil {
 		return nil, nil
 	}
-	if len(in) == 0 {
+	if in.Len == 0 {
 		return nil, nil
 	}
 	wrapErr := func(err error) error {
@@ -743,113 +774,73 @@ func checkRecvPayload(pf payloadFormat, recvCompress string, haveCompressor bool
 
 type payloadInfo struct {
 	compressedLength  int // The compressed length got from wire.
-	uncompressedBytes []byte
+	uncompressedBytes *internalencoding.MaterializedBufferSeq
 }
 
 // recvAndDecompress reads a message from the stream, decompressing it if necessary.
-//
-// Cancelling the returned cancel function releases the buffer back to the pool. So the caller should cancel as soon as
-// the buffer is no longer needed.
-func recvAndDecompress(p *parser, s *transport.Stream, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor,
-) (uncompressedBuf []byte, cancel func(), err error) {
-	pf, compressedBuf, err := p.recvMsg(maxReceiveMessageSize)
+func recvAndDecompress(
+	p *parser,
+	s *transport.Stream,
+	c internalencoding.BaseCodecV2,
+	dc internalencoding.BaseDecompressorV2,
+	maxReceiveMessageSize int,
+	payInfo *payloadInfo,
+) (uncompressed *internalencoding.MaterializedBufferSeq, err error) {
+	pf, compressed, err := p.recvMsg(c, dc, maxReceiveMessageSize)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	if st := checkRecvPayload(pf, s.RecvCompress(), compressor != nil || dc != nil); st != nil {
-		return nil, nil, st.Err()
+	if st := checkRecvPayload(pf, s.RecvCompress(), dc != nil); st != nil {
+		return nil, st.Err()
 	}
 
-	var size int
 	if pf == compressionMade {
-		// To match legacy behavior, if the decompressor is set by WithDecompressor or RPCDecompressor,
-		// use this decompressor as the default.
-		if dc != nil {
-			uncompressedBuf, err = dc.Do(bytes.NewReader(compressedBuf))
-			size = len(uncompressedBuf)
-		} else {
-			uncompressedBuf, size, err = decompress(compressor, compressedBuf, maxReceiveMessageSize)
-		}
+		uncompressed, err = dc.Decompress(compressed)
 		if err != nil {
-			return nil, nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
+			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
 		}
-		if size > maxReceiveMessageSize {
+		if uncompressed.Len > maxReceiveMessageSize {
+			uncompressed.Free()
 			// TODO: Revisit the error code. Currently keep it consistent with java
 			// implementation.
-			return nil, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
+			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
 		}
 	} else {
-		uncompressedBuf = compressedBuf
+		uncompressed = compressed
 	}
 
 	if payInfo != nil {
-		payInfo.compressedLength = len(compressedBuf)
-		payInfo.uncompressedBytes = uncompressedBuf
-
-		cancel = func() {}
-	} else {
-		cancel = func() {
-			p.recvBufferPool.Put(&compressedBuf)
-		}
+		payInfo.compressedLength = compressed.Len
+		payInfo.uncompressedBytes = uncompressed
 	}
 
-	return uncompressedBuf, cancel, nil
+	return uncompressed, nil
 }
 
-// Using compressor, decompress d, returning data and size.
-// Optionally, if data will be over maxReceiveMessageSize, just return the size.
-func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize int) ([]byte, int, error) {
-	dcReader, err := compressor.Decompress(bytes.NewReader(d))
-	if err != nil {
-		return nil, 0, err
-	}
-	if sizer, ok := compressor.(interface {
-		DecompressedSize(compressedBytes []byte) int
-	}); ok {
-		if size := sizer.DecompressedSize(d); size >= 0 {
-			if size > maxReceiveMessageSize {
-				return nil, size, nil
-			}
-			// size is used as an estimate to size the buffer, but we
-			// will read more data if available.
-			// +MinRead so ReadFrom will not reallocate if size is correct.
-			//
-			// TODO: If we ensure that the buffer size is the same as the DecompressedSize,
-			// we can also utilize the recv buffer pool here.
-			buf := bytes.NewBuffer(make([]byte, 0, size+bytes.MinRead))
-			bytesRead, err := buf.ReadFrom(io.LimitReader(dcReader, int64(maxReceiveMessageSize)+1))
-			return buf.Bytes(), int(bytesRead), err
-		}
-	}
-	// Read from LimitReader with limit max+1. So if the underlying
-	// reader is over limit, the result will be bigger than max.
-	d, err = io.ReadAll(io.LimitReader(dcReader, int64(maxReceiveMessageSize)+1))
-	return d, len(d), err
-}
-
-// For the two compressor parameters, both should not be set, but if they are,
-// dc takes precedence over compressor.
-// TODO(dfawley): wrap the old compressor/decompressor using the new API?
 func recv(
 	p *parser,
 	c internalencoding.BaseCodecV2,
 	s *transport.Stream,
-	dc Decompressor,
+	dc internalencoding.BaseDecompressorV2,
 	m any,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
-	compressor encoding.Compressor,
 ) error {
-	buf, cancel, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor)
+	msg, err := recvAndDecompress(p, s, c, dc, maxReceiveMessageSize, payInfo)
 	if err != nil {
 		return err
 	}
-	defer cancel()
 
-	if err := c.Unmarshal(m, len(buf), func(yield func([]byte, error) bool) {
-		yield(buf, nil)
-	}); err != nil {
+	err = c.Unmarshal(m, msg.Len, func(yield func(encoding.Buffer, error) bool) {
+		for _, b := range msg.Data {
+			if !yield(b, nil) {
+				break
+			}
+		}
+	})
+
+	if err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}
 	return nil
@@ -868,19 +859,23 @@ type rpcInfo struct {
 // and reuse marshalled bytes
 type compressorInfo struct {
 	codec internalencoding.BaseCodecV2
-	cp    Compressor
-	comp  encoding.Compressor
+	cp    internalencoding.BaseCompressorV2
 }
 
 type rpcInfoContextKey struct{}
 
 func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalencoding.BaseCodecV2, cp Compressor, comp encoding.Compressor) context.Context {
+	var cpV2 internalencoding.BaseCompressorV2
+	if cp != nil {
+		cpV2 = internalencoding.CompressorV0Bridge{Compressor: cp}
+	} else {
+		cpV2 = internalencoding.CompressorV1Bridge{Compressor: comp}
+	}
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{
 			codec: codec,
-			cp:    cp,
-			comp:  comp,
+			cp:    cpV2,
 		},
 	})
 }

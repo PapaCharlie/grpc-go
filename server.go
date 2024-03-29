@@ -1137,16 +1137,26 @@ func (s *Server) incrCallsFailed() {
 	s.channelz.ServerMetrics.CallsFailed.Add(1)
 }
 
-func (s *Server) sendResponse(ctx context.Context, t transport.ServerTransport, stream *transport.Stream, msg any, cp Compressor, opts *transport.Options, comp encoding.Compressor) error {
+func (s *Server) sendResponse(
+	ctx context.Context,
+	t transport.ServerTransport,
+	stream *transport.Stream,
+	msg any,
+	cp internalencoding.BaseCompressorV2,
+	opts *transport.Options,
+) error {
 	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err
 	}
-	compData, err := compress(data, cp, comp)
-	if err != nil {
-		channelz.Error(logger, s.channelz, "grpc: server failed to compress response: ", err)
-		return err
+	var compData *internalencoding.MaterializedBufferSeq
+	if cp != nil {
+		compData, err = compress(data, cp)
+		if err != nil {
+			channelz.Error(logger, s.channelz, "grpc: server failed to compress response: ", err)
+			return err
+		}
 	}
 	hdr, payload := msgHeader(data, compData)
 	// TODO(dfawley): should we be checking len(data) instead?

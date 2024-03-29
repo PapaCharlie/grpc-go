@@ -36,10 +36,10 @@ func init() {
 type codecV2 struct {
 }
 
-func (c *codecV2) Marshal(v any) *encoding.BufferSeq {
+func (c *codecV2) Marshal(v any) (int, encoding.BufferSeq) {
 	vv := messageV2Of(v)
 	if vv == nil {
-		return encoding.ErrBufferSeq(fmt.Errorf("proto: failed to marshal, message is %T, want proto.Message", v))
+		return 0, encoding.ErrBufferSeq(fmt.Errorf("proto: failed to marshal, message is %T, want proto.Message", v))
 	}
 
 	buf := encoding.NewBuffer(proto.Size(vv))
@@ -51,20 +51,20 @@ func (c *codecV2) Marshal(v any) *encoding.BufferSeq {
 		buf.SetData(data)
 	}
 
-	return encoding.OneElementSeq(len(data), buf, err)
+	return len(data), encoding.OneElementSeq(buf, err)
 }
 
 func (c *codecV2) GetBuffer(length int) encoding.Buffer {
 	return encoding.NewBuffer(length)
 }
 
-func (c *codecV2) Unmarshal(v any, data *encoding.BufferSeq) (err error) {
+func (c *codecV2) Unmarshal(v any, length int, data encoding.BufferSeq) (err error) {
 	vv := messageV2Of(v)
 	if vv == nil {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	buf, err := encoding.FullRead(data, encoding.NewBuffer)
+	buf, err := encoding.FullRead(length, data, encoding.NewBuffer)
 	if err != nil {
 		return err
 	}

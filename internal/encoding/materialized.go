@@ -6,9 +6,9 @@ import (
 	"google.golang.org/grpc/encoding"
 )
 
-func MaterializeBufferSeq(data *encoding.BufferSeq) (m *MaterializedBufferSeq, err error) {
+func MaterializeBufferSeq(length int, data encoding.BufferSeq) (m *MaterializedBufferSeq, err error) {
 	m = &MaterializedBufferSeq{}
-	data.Seq(func(buf encoding.Buffer, innerErr error) bool {
+	data(func(buf encoding.Buffer, innerErr error) bool {
 		if innerErr != nil {
 			innerErr = err
 			return false
@@ -22,8 +22,8 @@ func MaterializeBufferSeq(data *encoding.BufferSeq) (m *MaterializedBufferSeq, e
 		return nil, err
 	}
 
-	if m.Len != data.Len {
-		return nil, fmt.Errorf("grpc: too many bytes received from BufferSeq, expected %d got %d", data.Len, m.Len)
+	if m.Len != length {
+		return nil, fmt.Errorf("grpc: unexpected byte count from BufferSeq, expected %d got %d", length, m.Len)
 	}
 
 	return m, nil
@@ -48,5 +48,17 @@ func (m *MaterializedBufferSeq) Read(buf []byte) {
 		} else {
 			data.SetData(data.Data()[copied:])
 		}
+	}
+}
+
+func (m *MaterializedBufferSeq) ReadFull() []byte {
+	buf := make([]byte, m.Len)
+	m.Read(buf)
+	return buf
+}
+
+func (m *MaterializedBufferSeq) Free() {
+	for _, b := range m.Data {
+		b.Free()
 	}
 }

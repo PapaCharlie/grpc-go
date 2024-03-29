@@ -20,58 +20,15 @@ package encoding
 
 import (
 	"strings"
-
-	"google.golang.org/grpc/internal/grpcutil"
 )
-
-// CompressorV2 is used for compressing and decompressing when sending or
-// receiving messages.
-type CompressorV2 interface {
-	// Compress returns a BufferSeq containing the compressed data of the input
-	// BufferSeq. An error can be returned at any point in the sequence, terminating
-	// the execution.
-	Compress(in BufferSeq) (out BufferSeq)
-	// Decompress reads data from the input BufferSeq, decompresses it, and provides
-	// the uncompressed data via the returned BufferSeq. An error can be returned at
-	// any point in the sequence, terminating the execution.
-	Decompress(in BufferSeq) (out BufferSeq)
-	// Name is the name of the compression codec and is used to set the content
-	// coding header.  The result must be static; the result cannot change
-	// between calls.
-	Name() string
-}
-
-var registeredCompressorV2 = make(map[string]CompressorV2)
-
-// RegisterCompressorV2 registers the compressor with gRPC by its name. It can be
-// activated when sending an RPC via grpc.UseCompressor(). It will be
-// automatically accessed when receiving a message based on the content coding
-// header. Servers also use it to send a response with the same encoding as the
-// request.
-//
-// NOTE: this function must only be called during initialization time (i.e. in
-// an init() function), and is not thread-safe.  If multiple Compressors are
-// registered with the same name, the one registered last will take effect.
-func RegisterCompressorV2(c CompressorV2) {
-	registeredCompressorV2[c.Name()] = c
-	if !grpcutil.IsCompressorNameRegistered(c.Name()) {
-		grpcutil.RegisteredCompressorNames = append(grpcutil.RegisteredCompressorNames, c.Name())
-	}
-}
-
-// GetCompressorV2 returns the CompressorV2 for the given compressor name, or nil
-// if no compressor by that name was registered.
-func GetCompressorV2(name string) CompressorV2 {
-	return registeredCompressorV2[name]
-}
 
 // CodecV2 defines the interface gRPC uses to encode and decode messages. Note
 // that implementations of this interface must be thread safe; a CodecV2's
 // methods can be called from concurrent goroutines.
 type CodecV2 interface {
-	Marshal(v any) *BufferSeq
+	Marshal(v any) (length int, out BufferSeq)
 	GetBuffer(length int) Buffer
-	Unmarshal(v any, data *BufferSeq) error
+	Unmarshal(v any, length int, data BufferSeq) error
 	// Name returns the name of the Codec implementation. The returned string
 	// will be used as part of content type in transmission.  The result must be
 	// static; the result cannot change between calls.

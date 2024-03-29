@@ -29,7 +29,10 @@ func (b *buffer) SetData(data []byte) {
 }
 
 func (b *buffer) Free() {
-	globalBufferPool.Put(ClearBuffer(b.data))
+	if b.data != nil {
+		globalBufferPool.Put(ClearBuffer(b.data))
+		b.data = nil
+	}
 }
 
 func NewBuffer(size int) Buffer {
@@ -54,10 +57,30 @@ func ClearBuffer(buf []byte) []byte {
 	return buf
 }
 
+type simpleBuffer struct {
+	data []byte
+}
+
+func (s *simpleBuffer) Data() []byte {
+	return s.data
+}
+
+func (s *simpleBuffer) SetData(data []byte) {
+	s.data = data
+}
+
+func (s *simpleBuffer) Free() {}
+
+func SimpleBuffer(data []byte) Buffer {
+	return &simpleBuffer{data}
+}
+
 // BufferSeq is the equivalent of [iter.Seq][[Buffer], error], but cannot be added by
 // directly referencing the new [iter] package since it is not yet supported in
 // all versions of go supported by grpc-go.
 type BufferSeq = func(yield func(Buffer, error) bool)
+
+type BufferProvider = func(int) Buffer
 
 func ErrBufferSeq(err error) BufferSeq {
 	return OneElementSeq(nil, err)
@@ -69,9 +92,9 @@ func OneElementSeq(buf Buffer, err error) BufferSeq {
 	}
 }
 
-func FullRead(expectedLength int, data BufferSeq, newBuffer func(int) Buffer) (buf Buffer, err error) {
+func FullRead(length int, data BufferSeq, provider BufferProvider) (buf Buffer, err error) {
 	var buffers []Buffer
-	var receivedSize int
+	var receivedLength int
 	defer func() {
 		for _, b := range buffers {
 			b.Free()
@@ -85,7 +108,7 @@ func FullRead(expectedLength int, data BufferSeq, newBuffer func(int) Buffer) (b
 		}
 
 		buffers = append(buffers, buf)
-		receivedSize += len(buf.Data())
+		receivedLength += len(buf.Data())
 		return true
 	})
 
@@ -93,21 +116,21 @@ func FullRead(expectedLength int, data BufferSeq, newBuffer func(int) Buffer) (b
 		return nil, err
 	}
 
-	if receivedSize != expectedLength {
+	if receivedLength != length {
 		return nil, fmt.Errorf("proto: did not receive expected data size %d, got %d (%w)",
-			expectedLength, receivedSize, io.ErrShortBuffer)
+			length, receivedLength, io.ErrShortBuffer)
 	}
 
 	var fullBuffer Buffer
 
 	// If the entire data was received in one buffer, avoid copying altogether and use that one directly
-	if len(buffers[0].Data()) == expectedLength {
+	if len(buffers[0].Data()) == length {
 		fullBuffer = buffers[0]
 		// Prevent the defer from freeing the buffer
 		buffers = buffers[1:]
 	} else {
 		// Otherwise, materialize the buffer
-		fullBuffer = newBuffer(receivedSize)
+		fullBuffer = provider(receivedLength)
 		fullBuffer.SetData(fullBuffer.Data()[:0])
 		for _, b := range buffers {
 			fullBuffer.SetData(append(fullBuffer.Data(), b.Data()...))

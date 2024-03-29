@@ -4,19 +4,17 @@ import (
 	"google.golang.org/grpc/encoding"
 )
 
-type BaseCodec interface {
-	Marshal(v any) ([]byte, error)
-	Unmarshal(data []byte, v any) error
-}
-
 type BaseCodecV2 interface {
-	Marshal(v any) *encoding.BufferSeq
+	Marshal(v any) (int, encoding.BufferSeq)
 	GetBuffer(length int) encoding.Buffer
-	Unmarshal(v any, data *encoding.BufferSeq) error
+	Unmarshal(v any, length int, data encoding.BufferSeq) error
 }
 
 type CodecV1Bridge struct {
-	BaseCodec
+	Codec interface {
+		Marshal(v any) ([]byte, error)
+		Unmarshal(data []byte, v any) error
+	}
 }
 
 type noopBuffer struct {
@@ -33,17 +31,14 @@ func (n *noopBuffer) SetData(data []byte) {
 
 func (n *noopBuffer) Free() {}
 
-func (c CodecV1Bridge) Marshal(v any) *encoding.BufferSeq {
-	data, err := c.BaseCodec.Marshal(v)
+func (c CodecV1Bridge) Marshal(v any) (int, encoding.BufferSeq) {
+	data, err := c.Codec.Marshal(v)
 	var buf encoding.Buffer
 	if err == nil {
 		buf = &noopBuffer{data}
 	}
-	return &encoding.BufferSeq{
-		Len: len(data),
-		Seq: func(yield func(encoding.Buffer, error) bool) {
-			yield(buf, err)
-		},
+	return len(data), func(yield func(encoding.Buffer, error) bool) {
+		yield(buf, err)
 	}
 }
 
@@ -51,13 +46,13 @@ func (c CodecV1Bridge) GetBuffer(length int) encoding.Buffer {
 	return encoding.NewBuffer(length)
 }
 
-func (c CodecV1Bridge) Unmarshal(v any, data *encoding.BufferSeq) (err error) {
-	buf, err := encoding.FullRead(data, encoding.NewBuffer)
+func (c CodecV1Bridge) Unmarshal(v any, length int, data encoding.BufferSeq) (err error) {
+	buf, err := encoding.FullRead(length, data, encoding.NewBuffer)
 	if err != nil {
 		return err
 	}
 	defer buf.Free()
-	return c.BaseCodec.Unmarshal(buf.Data(), v)
+	return c.Codec.Unmarshal(buf.Data(), v)
 }
 
 func GetCodec(name string) BaseCodecV2 {
@@ -66,7 +61,7 @@ func GetCodec(name string) BaseCodecV2 {
 	if codec == nil {
 		codecV1 := encoding.GetCodec(name)
 		if codecV1 != nil {
-			codec = CodecV1Bridge{BaseCodec: codecV1}
+			codec = CodecV1Bridge{Codec: codecV1}
 		}
 	}
 	return codec
