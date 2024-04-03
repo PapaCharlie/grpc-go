@@ -327,8 +327,7 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 		cc:           cc,
 		desc:         desc,
 		codec:        c.codec,
-		cp:           cp,
-		comp:         comp,
+		cp:           newCompressorV2(cp, comp),
 		cancel:       cancel,
 		firstAttempt: true,
 		onCommit:     onCommit,
@@ -410,7 +409,7 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
 		return nil, ErrClientConnClosing
 	}
 
-	ctx := newContextWithRPCInfo(cs.ctx, cs.callInfo.failFast, cs.callInfo.codec, cs.cp, cs.comp)
+	ctx := newContextWithRPCInfo(cs.ctx, cs.callInfo.failFast, cs.callInfo.codec, cs.cp)
 	method := cs.callHdr.Method
 	var beginTime time.Time
 	shs := cs.cc.dopts.copts.StatsHandlers
@@ -529,9 +528,8 @@ type clientStream struct {
 	cc       *ClientConn
 	desc     *StreamDesc
 
-	codec baseCodec
-	cp    Compressor
-	comp  encoding.Compressor
+	codec internalencoding.BaseCodecV2
+	cp    internalencoding.BaseCompressorV2
 
 	cancel context.CancelFunc // cancels all attempts
 
@@ -891,13 +889,13 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp, cs.comp)
+	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp)
 	if err != nil {
 		return err
 	}
 
 	// TODO(dfawley): should we be checking len(data) instead?
-	if len(payload) > *cs.callInfo.maxSendMessageSize {
+	if payload.Size() > *cs.callInfo.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), *cs.callInfo.maxSendMessageSize)
 	}
 	op := func(a *csAttempt) error {
@@ -1034,7 +1032,7 @@ func (cs *clientStream) finish(err error) {
 	cs.cancel()
 }
 
-func (a *csAttempt) sendMsg(m any, hdr, payld, data []byte) error {
+func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data encoding.BufferSeq) error {
 	cs := a.cs
 	if a.trInfo != nil {
 		a.mu.Lock()
@@ -1763,7 +1761,7 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // prepareMsg returns the hdr, payload and data
 // using the compressors passed or using the
 // passed preparedmsg
-func prepareMsg(m any, codec internalencoding.BaseCodecV2, cp Compressor, comp encoding.Compressor) (hdr, payload, data []byte, err error) {
+func prepareMsg(m any, codec internalencoding.BaseCodecV2, cp internalencoding.BaseCompressorV2) (hdr []byte, payload, data encoding.BufferSeq, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.payload, preparedMsg.encodedData, nil
 	}
@@ -1773,7 +1771,7 @@ func prepareMsg(m any, codec internalencoding.BaseCodecV2, cp Compressor, comp e
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	compData, err := compress(data, cp, comp)
+	compData, err := compress(data, cp)
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -19,7 +19,6 @@
 package grpc
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/binary"
@@ -615,7 +614,7 @@ func (p *parser) recvMsg(
 	c internalencoding.BaseCodecV2,
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
-) (pf payloadFormat, msg *internalencoding.MaterializedBufferSeq, err error) {
+) (pf payloadFormat, msg encoding.BufferSeq, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -643,27 +642,15 @@ func (p *parser) recvMsg(
 		provider = c.GetBuffer
 	}
 
-	msg = new(internalencoding.MaterializedBufferSeq)
-	for msg.Len < int(length) {
-		// TODO(PapaCharlie): Make configurable? Is it even worth doing this here rather
-		// than reading the entire message into a single buffer?
-		const bufSize = 1 << 14
-		buf := provider(bufSize)
-
-		msg.Data = append(msg.Data, buf)
-
-		n, err := p.r.Read(buf.Data())
-		if err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
-
-			msg.Free()
-
-			return 0, nil, err
+	// TODO(PapaCharlie): Instead of allocating one large buffer and copying the
+	// bytes off of the wire into it, maybe this should be done at the HTTP/2 frame
+	// level directly, and the io.Reader API should be avoided.
+	buf := provider(int(length))
+	if _, err := p.r.Read(buf.Data()); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
 		}
-
-		msg.Len += n
+		return 0, nil, err
 	}
 
 	return pf, msg, nil
@@ -672,54 +659,35 @@ func (p *parser) recvMsg(
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c internalencoding.BaseCodecV2, msg any) (*internalencoding.MaterializedBufferSeq, error) {
+func encode(c internalencoding.BaseCodecV2, msg any) (encoding.BufferSeq, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
-	length, seq := c.Marshal(msg)
-	if uint(length) > math.MaxUint32 {
-		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", length)
+	data, err := c.Marshal(msg)
+	if uint(data.Size()) > math.MaxUint32 {
+		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", data.Size())
 	}
 
-	out, err := internalencoding.MaterializeBufferSeq(length, seq)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err.Error())
 	}
 
-	return out, nil
+	return data, nil
 }
 
 // compress returns the input bytes compressed by compressor or cp.
 // If both compressors are nil, or if the message has zero length, returns nil,
 // indicating no compression was done.
-func compress(in *internalencoding.MaterializedBufferSeq, cp internalencoding.BaseCompressorV2) (*internalencoding.MaterializedBufferSeq, error) {
-	if cp == nil {
+func compress(in encoding.BufferSeq, cp internalencoding.BaseCompressorV2) (encoding.BufferSeq, error) {
+	if cp == nil || in.Size() == 0 {
 		return nil, nil
 	}
-	if in.Len == 0 {
-		return nil, nil
+
+	out, err := cp.Compress(in)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "grpc: error while compressing: %v", err.Error())
 	}
-	wrapErr := func(err error) error {
-		return status.Errorf(codes.Internal, "grpc: error while compressing: %v", err.Error())
-	}
-	cbuf := &bytes.Buffer{}
-	if compressor != nil {
-		z, err := compressor.Compress(cbuf)
-		if err != nil {
-			return nil, wrapErr(err)
-		}
-		if _, err := z.Write(in); err != nil {
-			return nil, wrapErr(err)
-		}
-		if err := z.Close(); err != nil {
-			return nil, wrapErr(err)
-		}
-	} else {
-		if err := cp.Do(cbuf, in); err != nil {
-			return nil, wrapErr(err)
-		}
-	}
-	return cbuf.Bytes(), nil
+	return out, nil
 }
 
 const (
@@ -730,7 +698,7 @@ const (
 
 // msgHeader returns a 5-byte header for the message being transmitted and the
 // payload, which is compData if non-nil or data otherwise.
-func msgHeader(data, compData []byte) (hdr []byte, payload []byte) {
+func msgHeader(data, compData encoding.BufferSeq) (hdr []byte, payload encoding.BufferSeq) {
 	hdr = make([]byte, headerLen)
 	if compData != nil {
 		hdr[0] = byte(compressionMade)
@@ -740,7 +708,7 @@ func msgHeader(data, compData []byte) (hdr []byte, payload []byte) {
 	}
 
 	// Write length of payload into buf
-	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(len(data)))
+	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(data.Size()))
 	return hdr, data
 }
 
@@ -774,7 +742,7 @@ func checkRecvPayload(pf payloadFormat, recvCompress string, haveCompressor bool
 
 type payloadInfo struct {
 	compressedLength  int // The compressed length got from wire.
-	uncompressedBytes *internalencoding.MaterializedBufferSeq
+	uncompressedBytes encoding.BufferSeq
 }
 
 // recvAndDecompress reads a message from the stream, decompressing it if necessary.
@@ -785,7 +753,7 @@ func recvAndDecompress(
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
-) (uncompressed *internalencoding.MaterializedBufferSeq, err error) {
+) (uncompressed encoding.BufferSeq, err error) {
 	pf, compressed, err := p.recvMsg(c, dc, maxReceiveMessageSize)
 	if err != nil {
 		return nil, err
@@ -800,7 +768,7 @@ func recvAndDecompress(
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
 		}
-		if uncompressed.Len > maxReceiveMessageSize {
+		if size := uncompressed.Size(); size > maxReceiveMessageSize {
 			uncompressed.Free()
 			// TODO: Revisit the error code. Currently keep it consistent with java
 			// implementation.
@@ -811,7 +779,7 @@ func recvAndDecompress(
 	}
 
 	if payInfo != nil {
-		payInfo.compressedLength = compressed.Len
+		payInfo.compressedLength = compressed.Size()
 		payInfo.uncompressedBytes = uncompressed
 	}
 
@@ -832,14 +800,7 @@ func recv(
 		return err
 	}
 
-	err = c.Unmarshal(m, msg.Len, func(yield func(encoding.Buffer, error) bool) {
-		for _, b := range msg.Data {
-			if !yield(b, nil) {
-				break
-			}
-		}
-	})
-
+	err = c.Unmarshal(m, msg)
 	if err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}
@@ -864,18 +825,21 @@ type compressorInfo struct {
 
 type rpcInfoContextKey struct{}
 
-func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalencoding.BaseCodecV2, cp Compressor, comp encoding.Compressor) context.Context {
-	var cpV2 internalencoding.BaseCompressorV2
+func newCompressorV2(cp Compressor, comp encoding.Compressor) (cpV2 internalencoding.BaseCompressorV2) {
 	if cp != nil {
 		cpV2 = internalencoding.CompressorV0Bridge{Compressor: cp}
 	} else {
 		cpV2 = internalencoding.CompressorV1Bridge{Compressor: comp}
 	}
+	return cpV2
+}
+
+func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalencoding.BaseCodecV2, cp internalencoding.BaseCompressorV2) context.Context {
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{
 			codec: codec,
-			cp:    cpV2,
+			cp:    cp,
 		},
 	})
 }

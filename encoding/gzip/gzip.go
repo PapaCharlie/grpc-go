@@ -44,7 +44,7 @@ func init() {
 		return &writer{Writer: gzip.NewWriter(io.Discard), pool: &c.poolCompressor}
 	}
 	encoding.RegisterCompressor(c)
-	encoding.RegisterCompressorV2(&compressorV2{c: c})
+	//encoding.RegisterCompressorV2(&compressorV2{c: c})
 }
 
 type writer struct {

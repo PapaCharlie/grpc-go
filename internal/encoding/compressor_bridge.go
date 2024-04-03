@@ -8,7 +8,7 @@ import (
 )
 
 type BaseCompressorV2 interface {
-	Compress(in *MaterializedBufferSeq) (out *MaterializedBufferSeq, err error)
+	Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error)
 }
 
 type CompressorV0Bridge struct {
@@ -17,9 +17,8 @@ type CompressorV0Bridge struct {
 	}
 }
 
-func (c CompressorV0Bridge) Compress(in *MaterializedBufferSeq) (out *MaterializedBufferSeq, err error) {
-	data := encoding.NewBuffer(in.Len)
-	in.Read(data.Data())
+func (c CompressorV0Bridge) Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error) {
+	data := in.Concat(encoding.NewBuffer)
 	defer data.Free()
 
 	buf := new(bytes.Buffer)
@@ -27,10 +26,7 @@ func (c CompressorV0Bridge) Compress(in *MaterializedBufferSeq) (out *Materializ
 	if err != nil {
 		return nil, err
 	}
-	return &MaterializedBufferSeq{
-		Len:  buf.Len(),
-		Data: []encoding.Buffer{encoding.SimpleBuffer(buf.Bytes())},
-	}, nil
+	return encoding.BufferSeq{encoding.SimpleBuffer(buf.Bytes())}, nil
 }
 
 type CompressorV1Bridge struct {
@@ -39,33 +35,28 @@ type CompressorV1Bridge struct {
 	}
 }
 
-type seqWriter struct {
-	seq *MaterializedBufferSeq
-}
+type seqWriter encoding.BufferSeq
 
-func (s *seqWriter) Write(data []byte) (n int, err error) {
+func (s *seqWriter) Write(data []byte) (int, error) {
 	buf := encoding.NewBuffer(len(data))
-	s.seq.Data = append(s.seq.Data, buf)
-	n = copy(buf.Data(), data)
-	s.seq.Len += n
-	return n, nil
+	copy(buf.Data(), data)
+	*s = append(*s, buf)
+	return len(data), nil
 }
 
-func (c CompressorV1Bridge) Compress(in *MaterializedBufferSeq) (out *MaterializedBufferSeq, err error) {
-	out = new(MaterializedBufferSeq)
-
+func (c CompressorV1Bridge) Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error) {
 	defer func() {
 		if err != nil {
 			out.Free()
 		}
 	}()
 
-	w, err := c.Compressor.Compress(&seqWriter{seq: out})
+	w, err := c.Compressor.Compress((*seqWriter)(&out))
 	if err != nil {
 		return nil, err
 	}
 
-	for _, b := range in.Data {
+	for _, b := range in {
 		_, err = w.Write(b.Data())
 		b.Free()
 		if err != nil {
@@ -83,7 +74,7 @@ func (c CompressorV1Bridge) Compress(in *MaterializedBufferSeq) (out *Materializ
 
 type BaseDecompressorV2 interface {
 	GetBuffer(length int) encoding.Buffer
-	Decompress(in *MaterializedBufferSeq) (out *MaterializedBufferSeq, err error)
+	Decompress(in encoding.BufferSeq) (out encoding.BufferSeq, err error)
 }
 
 type DecompressorV0Bridge struct {

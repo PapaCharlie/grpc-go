@@ -26,9 +26,9 @@ import (
 // that implementations of this interface must be thread safe; a CodecV2's
 // methods can be called from concurrent goroutines.
 type CodecV2 interface {
-	Marshal(v any) (length int, out BufferSeq)
+	Marshal(v any) (out BufferSeq, err error)
 	GetBuffer(length int) Buffer
-	Unmarshal(v any, length int, data BufferSeq) error
+	Unmarshal(v any, data BufferSeq) error
 	// Name returns the name of the Codec implementation. The returned string
 	// will be used as part of content type in transmission.  The result must be
 	// static; the result cannot change between calls.

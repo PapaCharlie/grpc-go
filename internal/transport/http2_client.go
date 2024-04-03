@@ -1048,7 +1048,7 @@ func (t *http2Client) GracefulClose() {
 
 // Write formats the data into HTTP2 data frame(s) and sends it out. The caller
 // should proceed only if Write returns nil.
-func (t *http2Client) Write(s *Stream, hdr []byte, data *encoding.BufferSeq, opts *Options) error {
+func (t *http2Client) Write(s *Stream, hdr []byte, data encoding.BufferSeq, opts *Options) error {
 	if opts.Last {
 		// If it's the last message, update stream state.
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
@@ -1058,20 +1058,14 @@ func (t *http2Client) Write(s *Stream, hdr []byte, data *encoding.BufferSeq, opt
 		return errStreamDone
 	}
 
-	d, err := materializeBufferSeq(data)
-	if err != nil {
-		// TODO: any cleanup necessary here?
-		return err
-	}
-
 	df := &dataFrame{
 		streamID:  s.id,
 		endStream: opts.Last,
 		h:         hdr,
-		d:         d,
+		d:         newBufferSeqReader(data),
 	}
 	if hdr != nil || data != nil { // If it's not an empty data frame, check quota.
-		if err := s.wq.get(int32(len(hdr) + data.Len)); err != nil {
+		if err := s.wq.get(int32(len(hdr) + df.d.remaining())); err != nil {
 			return err
 		}
 	}

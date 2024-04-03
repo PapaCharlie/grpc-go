@@ -1,0 +1,101 @@
+package internal
+
+import (
+	"sync"
+)
+
+func NewSimpleSharedBufferPool() *SimpleSharedBufferPool {
+	return &SimpleSharedBufferPool{
+		pools: [poolArraySize]simpleSharedBufferChildPool{
+			newBytesPool(level0PoolMaxSize),
+			newBytesPool(level1PoolMaxSize),
+			newBytesPool(level2PoolMaxSize),
+			newBytesPool(level3PoolMaxSize),
+			newBytesPool(level4PoolMaxSize),
+			newBytesPool(0),
+		},
+	}
+}
+
+// SimpleSharedBufferPool is a simple implementation of SharedBufferPool.
+type SimpleSharedBufferPool struct {
+	pools [poolArraySize]simpleSharedBufferChildPool
+}
+
+func (p *SimpleSharedBufferPool) Get(size int) []byte {
+	return p.pools[p.poolIdx(size)].Get(size)
+}
+
+func (p *SimpleSharedBufferPool) Put(bs *[]byte) {
+	p.pools[p.poolIdx(cap(*bs))].Put(bs)
+}
+
+func (p *SimpleSharedBufferPool) poolIdx(size int) int {
+	switch {
+	case size <= level0PoolMaxSize:
+		return level0PoolIdx
+	case size <= level1PoolMaxSize:
+		return level1PoolIdx
+	case size <= level2PoolMaxSize:
+		return level2PoolIdx
+	case size <= level3PoolMaxSize:
+		return level3PoolIdx
+	case size <= level4PoolMaxSize:
+		return level4PoolIdx
+	default:
+		return levelMaxPoolIdx
+	}
+}
+
+const (
+	level0PoolMaxSize = 16                     //  16  B
+	level1PoolMaxSize = level0PoolMaxSize * 16 // 256  B
+	level2PoolMaxSize = level1PoolMaxSize * 16 //   4 KB
+	level3PoolMaxSize = level2PoolMaxSize * 16 //  64 KB
+	level4PoolMaxSize = level3PoolMaxSize * 16 //   1 MB
+)
+
+const (
+	level0PoolIdx = iota
+	level1PoolIdx
+	level2PoolIdx
+	level3PoolIdx
+	level4PoolIdx
+	levelMaxPoolIdx
+	poolArraySize
+)
+
+type simpleSharedBufferChildPool interface {
+	Get(size int) []byte
+	Put(any)
+}
+
+type bufferPool struct {
+	sync.Pool
+
+	defaultSize int
+}
+
+func (p *bufferPool) Get(size int) []byte {
+	bs := p.Pool.Get().(*[]byte)
+
+	if cap(*bs) < size {
+		p.Pool.Put(bs)
+
+		return make([]byte, size)
+	}
+
+	return (*bs)[:size]
+}
+
+func newBytesPool(size int) simpleSharedBufferChildPool {
+	return &bufferPool{
+		Pool: sync.Pool{
+			New: func() any {
+				bs := make([]byte, size)
+				return &bs
+			},
+		},
+		defaultSize: size,
+	}
+}

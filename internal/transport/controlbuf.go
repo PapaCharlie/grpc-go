@@ -30,7 +30,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	internalencoding "google.golang.org/grpc/internal/encoding"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/status"
@@ -149,7 +149,7 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	h         []byte
-	d         *internalencoding.MaterializedBufferSeq
+	d         *bufferSeqReader
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -911,7 +911,7 @@ func (l *loopyWriter) processData() (bool, error) {
 	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
 	// maximum possible HTTP2 frame size.
 
-	if len(dataItem.h) == 0 && dataItem.d.Len == 0 { // Empty data frame
+	if len(dataItem.h) == 0 && dataItem.d.remaining() == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
 		if err := l.framer.fr.WriteData(dataItem.streamID, dataItem.endStream, nil); err != nil {
 			return false, err
@@ -945,8 +945,8 @@ func (l *loopyWriter) processData() (bool, error) {
 	}
 	// Compute how much of the header and data we can send within quota and max frame length
 	hSize := min(maxSize, len(dataItem.h))
-	dSize := min(maxSize-hSize, dataItem.d.Len)
-	remainingBytes := len(dataItem.h) + dataItem.d.Len - hSize - dSize
+	dSize := min(maxSize-hSize, dataItem.d.remaining())
+	remainingBytes := len(dataItem.h) + dataItem.d.remaining() - hSize - dSize
 
 	var buf []byte
 
@@ -959,7 +959,7 @@ func (l *loopyWriter) processData() (bool, error) {
 		defer bufPool.Put(buf)
 
 		copy(buf[:hSize], dataItem.h)
-		dataItem.d.Read(buf[hSize:])
+		dataItem.d.read(buf[hSize:])
 		buf = buf[:hSize+dSize]
 	}
 
@@ -1007,4 +1007,38 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+type bufferSeqReader struct {
+	seq      encoding.BufferSeq
+	len, idx int
+}
+
+func newBufferSeqReader(data encoding.BufferSeq) *bufferSeqReader {
+	return &bufferSeqReader{
+		seq: data,
+		len: data.Size(),
+	}
+}
+
+func (r *bufferSeqReader) remaining() int {
+	return r.len - r.idx
+}
+
+func (r *bufferSeqReader) read(buf []byte) {
+	for len(buf) != 0 && r.len != 0 {
+		data := r.seq[0]
+		copied := copy(buf, data.Data()[r.idx:])
+		r.len -= copied
+
+		buf = buf[copied:]
+
+		if copied == len(data.Data()) {
+			data.Free()
+			r.seq = r.seq[1:]
+			r.idx = 0
+		} else {
+			r.idx += copied
+		}
+	}
 }

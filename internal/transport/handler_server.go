@@ -331,22 +331,17 @@ func (ht *serverHandlerTransport) writeCustomHeaders(s *Stream) {
 	s.hdrMu.Unlock()
 }
 
-func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data *encoding.BufferSeq, opts *Options) error {
+func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data encoding.BufferSeq, opts *Options) error {
 	headersWritten := s.updateHeaderSent()
 	return ht.do(func() {
 		if !headersWritten {
 			ht.writePendingHeaders(s)
 		}
 		ht.rw.Write(hdr)
-		data.Seq(func(buf encoding.Buffer, err error) bool {
-			if err != nil {
-				// TODO: What to do with this error????
-				return false
-			}
-			defer buf.Free()
-			ht.rw.Write(buf.Data())
-			return true
-		})
+		defer data.Free()
+		for _, b := range data {
+			ht.rw.Write(b.Data())
+		}
 		ht.rw.(http.Flusher).Flush()
 	})
 }

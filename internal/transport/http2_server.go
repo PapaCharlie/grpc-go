@@ -1113,7 +1113,7 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
-func (t *http2Server) Write(s *Stream, hdr []byte, data *encoding.BufferSeq, opts *Options) error {
+func (t *http2Server) Write(s *Stream, hdr []byte, data encoding.BufferSeq, opts *Options) error {
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		if err := t.WriteHeader(s, nil); err != nil {
 			return err
@@ -1125,19 +1125,13 @@ func (t *http2Server) Write(s *Stream, hdr []byte, data *encoding.BufferSeq, opt
 		}
 	}
 
-	d, err := materializeBufferSeq(data)
-	if err != nil {
-		// TODO: any cleanup necessary here?
-		return err
-	}
-
 	df := &dataFrame{
 		streamID:    s.id,
 		h:           hdr,
-		d:           d,
+		d:           newBufferSeqReader(data),
 		onEachWrite: t.setResetPingStrikes,
 	}
-	if err := s.wq.get(int32(len(hdr) + data.Len)); err != nil {
+	if err := s.wq.get(int32(len(hdr) + df.d.remaining())); err != nil {
 		return t.streamContextErr(s)
 	}
 	return t.controlBuf.put(df)

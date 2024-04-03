@@ -5,9 +5,9 @@ import (
 )
 
 type BaseCodecV2 interface {
-	Marshal(v any) (int, encoding.BufferSeq)
+	Marshal(v any) (encoding.BufferSeq, error)
 	GetBuffer(length int) encoding.Buffer
-	Unmarshal(v any, length int, data encoding.BufferSeq) error
+	Unmarshal(v any, data encoding.BufferSeq) error
 }
 
 type CodecV1Bridge struct {
@@ -17,28 +17,12 @@ type CodecV1Bridge struct {
 	}
 }
 
-type noopBuffer struct {
-	data []byte
-}
-
-func (n *noopBuffer) Data() []byte {
-	return n.data
-}
-
-func (n *noopBuffer) SetData(data []byte) {
-	n.data = data
-}
-
-func (n *noopBuffer) Free() {}
-
-func (c CodecV1Bridge) Marshal(v any) (int, encoding.BufferSeq) {
+func (c CodecV1Bridge) Marshal(v any) (encoding.BufferSeq, error) {
 	data, err := c.Codec.Marshal(v)
-	var buf encoding.Buffer
-	if err == nil {
-		buf = &noopBuffer{data}
-	}
-	return len(data), func(yield func(encoding.Buffer, error) bool) {
-		yield(buf, err)
+	if err != nil {
+		return nil, err
+	} else {
+		return encoding.BufferSeq{encoding.SimpleBuffer(data)}, nil
 	}
 }
 
@@ -46,11 +30,8 @@ func (c CodecV1Bridge) GetBuffer(length int) encoding.Buffer {
 	return encoding.NewBuffer(length)
 }
 
-func (c CodecV1Bridge) Unmarshal(v any, length int, data encoding.BufferSeq) (err error) {
-	buf, err := encoding.FullRead(length, data, encoding.NewBuffer)
-	if err != nil {
-		return err
-	}
+func (c CodecV1Bridge) Unmarshal(v any, data encoding.BufferSeq) (err error) {
+	buf := data.Concat(encoding.NewBuffer)
 	defer buf.Free()
 	return c.Codec.Unmarshal(buf.Data(), v)
 }
