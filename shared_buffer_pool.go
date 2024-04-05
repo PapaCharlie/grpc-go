@@ -54,3 +54,10 @@ func (nopBufferPool) Get(length int) []byte {
 
 func (nopBufferPool) Put(*[]byte) {
 }
+
+func (p nopBufferPool) GetBuffer(length int) []byte {
+	return p.Get(length)
+}
+
+func (p nopBufferPool) ReturnBuffer([]byte) {
+}

@@ -54,7 +54,7 @@ func (c CompressorV1Bridge) Compress(in [][]byte) (out [][]byte, err error) {
 }
 
 type BaseDecompressorV2 interface {
-	Decompress(in [][]byte) (out [][]byte, err error)
+	Decompress(in [][]byte, provider encoding.BufferProvider) (out [][]byte, err error)
 }
 
 type DecompressorV0Bridge struct {

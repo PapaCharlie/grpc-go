@@ -614,7 +614,7 @@ func (p *parser) recvMsg(
 	c internalencoding.BaseCodecV2,
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
-) (pf payloadFormat, _ [][]byte, err error) {
+) (pf payloadFormat, _ []*buffer, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -635,7 +635,7 @@ func (p *parser) recvMsg(
 	// TODO(PapaCharlie): Instead of allocating one large buffer and copying the
 	// bytes off of the wire into it, maybe this should be done at the HTTP/2 frame
 	// level directly, and the io.Reader API should be avoided.
-	var msg []byte
+	var msg *buffer
 
 	// Choose the appropriate BufferProvider based on whether the message was
 	// compressed. If the message wasn't compressed it's important to use the codec's
@@ -647,22 +647,23 @@ func (p *parser) recvMsg(
 		provider, _ = c.(encoding.BufferProvider)
 	}
 
-	if provider != nil {
-		msg = provider.GetBuffer(int(length))
-	} else {
-		// If the corresponding objects don't implement the BufferProvider interface,
-		// fall back to the configured recvBufferPool.
-		msg = p.recvBufferPool.Get(int(length))
+	// If the corresponding objects don't implement the BufferProvider interface,
+	// fall back to the configured recvBufferPool.
+	if provider == nil {
+		provider = p.recvBufferPool
 	}
 
-	if _, err := p.r.Read(msg); err != nil {
+	msg = newBuffer(p.recvBufferPool.Get(int(length)), provider)
+
+	if _, err := p.r.Read(msg.data); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
+		msg.free()
 		return 0, nil, err
 	}
 
-	return pf, [][]byte{msg}, nil
+	return pf, []*buffer{msg}, nil
 }
 
 // encode serializes msg and returns a buffer containing the message, or an
@@ -751,7 +752,7 @@ func checkRecvPayload(pf payloadFormat, recvCompress string, haveCompressor bool
 
 type payloadInfo struct {
 	compressedLength  int // The compressed length got from wire.
-	uncompressedBytes [][]byte
+	uncompressedBytes []*buffer
 }
 
 // recvAndDecompress reads a message from the stream, decompressing it if necessary.
@@ -762,18 +763,25 @@ func recvAndDecompress(
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
-) (uncompressed [][]byte, err error) {
+) (out []*buffer, er error) {
 	pf, compressed, err := p.recvMsg(c, dc, maxReceiveMessageSize)
 	if err != nil {
 		return nil, err
 	}
 
 	if st := checkRecvPayload(pf, s.RecvCompress(), dc != nil); st != nil {
+		freeAll(compressed)
 		return nil, st.Err()
 	}
 
 	if pf == compressionMade {
-		uncompressed, err = dc.Decompress(compressed)
+		defer freeAll(compressed)
+		provider, ok := c.(encoding.BufferProvider)
+		if !ok {
+			provider = p.recvBufferPool
+		}
+
+		uncompressed, err := dc.Decompress(unwrapBufferSlice(compressed), provider)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
 		}
@@ -782,16 +790,20 @@ func recvAndDecompress(
 			// implementation.
 			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
 		}
+		for _, b := range uncompressed {
+			out = append(out, newBuffer(b, provider))
+		}
 	} else {
-		uncompressed = compressed
+		out = compressed
 	}
 
 	if payInfo != nil {
-		payInfo.compressedLength = encoding.BufferSliceSize(compressed)
-		payInfo.uncompressedBytes = uncompressed
+		payInfo.compressedLength = bufferSliceSize(compressed)
+		referenceAll(out)
+		payInfo.uncompressedBytes = out
 	}
 
-	return uncompressed, nil
+	return out, nil
 }
 
 func recv(
@@ -808,7 +820,9 @@ func recv(
 		return err
 	}
 
-	err = c.Unmarshal(m, msg)
+	defer freeAll(msg)
+
+	err = c.Unmarshal(m, unwrapBufferSlice(msg))
 	if err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}

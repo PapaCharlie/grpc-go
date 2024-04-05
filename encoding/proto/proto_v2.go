@@ -29,13 +29,13 @@ import (
 )
 
 func init() {
-	encoding.RegisterCodecV2(&codecV2{pool: internal.NewSharedBufferPool()})
+	encoding.RegisterCodecV2(&codecV2{SharedBufferPool: internal.NewSharedBufferPool()})
 }
 
 // codec is an experimental.CodecV2 implementation with protobuf. It is the
 // default codec for gRPC.
 type codecV2 struct {
-	pool internal.SharedBufferPool
+	internal.SharedBufferPool
 }
 
 var _ encoding.CodecV2 = (*codecV2)(nil)
@@ -71,12 +71,4 @@ func (c *codecV2) Unmarshal(v any, data [][]byte) (err error) {
 
 func (c *codecV2) Name() string {
 	return Name
-}
-
-func (c *codecV2) GetBuffer(length int) []byte {
-	return c.pool.Get(length)
-}
-
-func (c *codecV2) ReturnBuffer(buf []byte) {
-	c.pool.Put(&buf)
 }

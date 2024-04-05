@@ -581,8 +581,7 @@ type csAttempt struct {
 	pickResult balancer.PickResult
 
 	finished  bool
-	dc        Decompressor
-	decomp    encoding.Compressor
+	dc        internalencoding.BaseDecompressorV2
 	decompSet bool
 
 	mu sync.Mutex // guards trInfo.tr
@@ -1081,7 +1080,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		// Only initialize this state once per stream.
 		a.decompSet = true
 	}
-	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, payInfo, a.decomp)
+	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, payInfo)
 	if err != nil {
 		if err == io.EOF {
 			if statusErr := a.s.Status().Err(); statusErr != nil {
@@ -1099,17 +1098,20 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		}
 		a.mu.Unlock()
 	}
-	for _, sh := range a.statsHandlers {
-		sh.HandleRPC(a.ctx, &stats.InPayload{
-			Client:   true,
-			RecvTime: time.Now(),
-			Payload:  m,
-			// TODO truncate large payload.
-			Data:             payInfo.uncompressedBytes,
-			WireLength:       payInfo.compressedLength + headerLen,
-			CompressedLength: payInfo.compressedLength,
-			Length:           len(payInfo.uncompressedBytes),
-		})
+	if len(a.statsHandlers) != 0 {
+		data := encoding.ConcatBuffersSlice(unwrapBufferSlice(payInfo.uncompressedBytes), nil)
+		for _, sh := range a.statsHandlers {
+			sh.HandleRPC(a.ctx, &stats.InPayload{
+				Client:   true,
+				RecvTime: time.Now(),
+				Payload:  m,
+				// TODO truncate large payload.
+				Data:             data,
+				WireLength:       payInfo.compressedLength + headerLen,
+				CompressedLength: payInfo.compressedLength,
+				Length:           len(payInfo.uncompressedBytes),
+			})
+		}
 	}
 	if channelz.IsOn() {
 		a.t.IncrMsgRecv()
@@ -1120,7 +1122,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 	}
 	// Special handling for non-server-stream rpcs.
 	// This recv expects EOF or errors, so we don't collect inPayload.
-	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, nil, a.decomp)
+	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, nil)
 	if err == nil {
 		return toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
 	}
@@ -1310,12 +1312,10 @@ type addrConnStream struct {
 	ctx       context.Context
 	sentLast  bool
 	desc      *StreamDesc
-	codec     baseCodec
-	cp        Compressor
-	comp      encoding.Compressor
+	codec     internalencoding.BaseCodecV2
+	cp        internalencoding.BaseCompressorV2
 	decompSet bool
-	dc        Decompressor
-	decomp    encoding.Compressor
+	dc        internalencoding.BaseDecompressorV2
 	p         *parser
 	mu        sync.Mutex
 	finished  bool
@@ -1371,7 +1371,7 @@ func (as *addrConnStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payld, _, err := prepareMsg(m, as.codec, as.cp, as.comp)
+	hdr, payld, _, err := prepareMsg(m, as.codec, as.cp)
 	if err != nil {
 		return err
 	}

@@ -20,10 +20,13 @@ type SharedBufferPool interface {
 
 	// Put returns a buffer to the pool.
 	Put(*[]byte)
+
+	GetBuffer(length int) []byte
+	ReturnBuffer(buf []byte)
 }
 
 func NewSharedBufferPool() SharedBufferPool {
-	return &SimpleSharedBufferPool{
+	return &simpleSharedBufferPool{
 		pools: [poolArraySize]simpleSharedBufferChildPool{
 			newBytesPool(level0PoolMaxSize),
 			newBytesPool(level1PoolMaxSize),
@@ -35,20 +38,28 @@ func NewSharedBufferPool() SharedBufferPool {
 	}
 }
 
-// SimpleSharedBufferPool is a simple implementation of SharedBufferPool.
-type SimpleSharedBufferPool struct {
+// simpleSharedBufferPool is a simple implementation of SharedBufferPool.
+type simpleSharedBufferPool struct {
 	pools [poolArraySize]simpleSharedBufferChildPool
 }
 
-func (p *SimpleSharedBufferPool) Get(size int) []byte {
+func (p *simpleSharedBufferPool) Get(size int) []byte {
 	return p.pools[p.poolIdx(size)].Get(size)
 }
 
-func (p *SimpleSharedBufferPool) Put(bs *[]byte) {
+func (p *simpleSharedBufferPool) Put(bs *[]byte) {
 	p.pools[p.poolIdx(cap(*bs))].Put(bs)
 }
 
-func (p *SimpleSharedBufferPool) poolIdx(size int) int {
+func (p *simpleSharedBufferPool) GetBuffer(size int) []byte {
+	return p.Get(size)
+}
+
+func (p *simpleSharedBufferPool) ReturnBuffer(buf []byte) {
+	p.Put(&buf)
+}
+
+func (p *simpleSharedBufferPool) poolIdx(size int) int {
 	switch {
 	case size <= level0PoolMaxSize:
 		return level0PoolIdx
