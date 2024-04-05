@@ -1099,7 +1099,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		a.mu.Unlock()
 	}
 	if len(a.statsHandlers) != 0 {
-		data := encoding.ConcatBuffersSlice(unwrapBufferSlice(payInfo.uncompressedBytes), nil)
+		data := encoding.ConcatBufferSlice(unwrapBufferSlice(payInfo.uncompressedBytes), nil)
 		for _, sh := range a.statsHandlers {
 			sh.HandleRPC(a.ctx, &stats.InPayload{
 				Client:   true,

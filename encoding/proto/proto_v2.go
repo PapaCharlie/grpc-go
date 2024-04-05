@@ -63,7 +63,7 @@ func (c *codecV2) Unmarshal(v any, data [][]byte) (err error) {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	buf := encoding.ConcatBuffersSlice(data, c)
+	buf := encoding.ConcatBufferSlice(data, c)
 	defer c.ReturnBuffer(buf)
 
 	return proto.Unmarshal(buf, vv)

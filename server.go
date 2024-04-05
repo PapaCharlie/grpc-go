@@ -314,7 +314,7 @@ func KeepaliveEnforcementPolicy(kep keepalive.EnforcementPolicy) ServerOption {
 // Will be supported throughout 1.x.
 func CustomCodec(codec Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = internalencoding.CodecV1Bridge{BaseCodec: codec}
+		o.codec = internalencoding.CodecV1Bridge{Codec: codec}
 	})
 }
 
@@ -343,7 +343,7 @@ func CustomCodec(codec Codec) ServerOption {
 // later release.
 func ForceServerCodec(codec encoding.Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = internalencoding.CodecV1Bridge{BaseCodec: codec}
+		o.codec = internalencoding.CodecV1Bridge{Codec: codec}
 	})
 }
 
@@ -1150,7 +1150,7 @@ func (s *Server) sendResponse(
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err
 	}
-	var compData *internalencoding.MaterializedBufferSeq
+	var compData [][]byte
 	if cp != nil {
 		compData, err = compress(data, cp)
 		if err != nil {
@@ -1165,8 +1165,10 @@ func (s *Server) sendResponse(
 	}
 	err = t.Write(stream, hdr, payload, opts)
 	if err == nil {
-		for _, sh := range s.opts.statsHandlers {
-			sh.HandleRPC(ctx, outPayload(false, msg, data, payload, time.Now()))
+		if len(s.opts.statsHandlers) != 0 {
+			for _, sh := range s.opts.statsHandlers {
+				sh.HandleRPC(ctx, outPayload(false, msg, data, payload, time.Now()))
+			}
 		}
 	}
 	return err
@@ -1303,22 +1305,22 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 	// decompression.  If comp and decomp are both set, they are the same;
 	// however they are kept separate to ensure that at most one of the
 	// compressor/decompressor variable pairs are set for use later.
-	var comp, decomp encoding.Compressor
-	var cp Compressor
-	var dc Decompressor
+	var cp internalencoding.BaseCompressorV2
+	var dc internalencoding.BaseDecompressorV2
 	var sendCompressorName string
 
 	// If dc is set and matches the stream's compression, use it.  Otherwise, try
 	// to find a matching registered compressor for decomp.
 	if rc := stream.RecvCompress(); s.opts.dc != nil && s.opts.dc.Type() == rc {
-		dc = s.opts.dc
+		dc = internalencoding.DecompressorV0Bridge{Decompressor: s.opts.dc}
 	} else if rc != "" && rc != encoding.Identity {
-		decomp = encoding.GetCompressor(rc)
-		if decomp == nil {
+		comp := encoding.GetCompressor(rc)
+		if comp == nil {
 			st := status.Newf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", rc)
 			t.WriteStatus(stream, st)
 			return st.Err()
 		}
+		dc = internalencoding.DecompressorV1Bridge{Decompressor: comp}
 	}
 
 	// If cp is set, use it.  Otherwise, attempt to compress the response using
@@ -1347,7 +1349,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 		payInfo = &payloadInfo{}
 	}
 
-	d, cancel, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
+	d, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, dc, s.opts.maxReceiveMessageSize, payInfo)
 	if err != nil {
 		if e := t.WriteStatus(stream, status.Convert(err)); e != nil {
 			channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
@@ -1358,21 +1360,24 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 		t.IncrMsgRecv()
 	}
 	df := func(v any) error {
-		defer cancel()
+		defer freeAll(d)
 
 		codec := s.getCodec(stream.ContentSubtype())
-		if err := codec.Unmarshal(v, len(d), func(yield func([]byte, error) bool) { yield(d, nil) }); err != nil {
+		if err := codec.Unmarshal(v, unwrapBufferSlice(d)); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
 		}
-		for _, sh := range shs {
-			sh.HandleRPC(ctx, &stats.InPayload{
-				RecvTime:         time.Now(),
-				Payload:          v,
-				Length:           len(d),
-				WireLength:       payInfo.compressedLength + headerLen,
-				CompressedLength: payInfo.compressedLength,
-				Data:             d,
-			})
+		if len(shs) != 0 {
+			data := encoding.ConcatBufferSlice(unwrapBufferSlice(d), nil, true)
+			for _, sh := range shs {
+				sh.HandleRPC(ctx, &stats.InPayload{
+					RecvTime:         time.Now(),
+					Payload:          v,
+					Length:           len(d),
+					WireLength:       payInfo.compressedLength + headerLen,
+					CompressedLength: payInfo.compressedLength,
+					Data:             data,
+				})
+			}
 		}
 		if len(binlogs) != 0 {
 			cm := &binarylog.ClientMessage{

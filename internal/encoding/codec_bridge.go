@@ -26,7 +26,7 @@ func (c CodecV1Bridge) Marshal(v any) ([][]byte, error) {
 }
 
 func (c CodecV1Bridge) Unmarshal(v any, data [][]byte) (err error) {
-	return c.Codec.Unmarshal(encoding.ConcatBuffersSlice(data, nil), v)
+	return c.Codec.Unmarshal(encoding.ConcatBufferSlice(data, nil), v)
 }
 
 func GetCodec(name string) BaseCodecV2 {

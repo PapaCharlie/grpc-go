@@ -65,9 +65,9 @@ func BufferSliceSize(buffers [][]byte) (l int) {
 	return l
 }
 
-func ConcatBuffersSlice(buffers [][]byte, provider BufferProvider) []byte {
+func ConcatBufferSlice(buffers [][]byte, provider BufferProvider, alwaysCopy bool) []byte {
 	// If the entire data was received in one buffer, avoid copying altogether and use that one directly
-	if len(buffers) == 1 {
+	if len(buffers) == 1 && !alwaysCopy {
 		return buffers[0]
 	} else {
 		// Otherwise, materialize the buffer

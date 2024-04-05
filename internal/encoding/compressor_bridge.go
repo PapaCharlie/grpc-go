@@ -19,7 +19,7 @@ type CompressorV0Bridge struct {
 
 func (c CompressorV0Bridge) Compress(in [][]byte) (out [][]byte, err error) {
 	buf := new(bytes.Buffer)
-	err = c.Compressor.Do(buf, encoding.ConcatBuffersSlice(in, nil))
+	err = c.Compressor.Do(buf, encoding.ConcatBufferSlice(in, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -63,8 +63,18 @@ type DecompressorV0Bridge struct {
 	}
 }
 
+func (d DecompressorV0Bridge) Decompress(in [][]byte, provider encoding.BufferProvider) (out [][]byte, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
 type DecompressorV1Bridge struct {
 	Decompressor interface {
 		Decompress(r io.Reader) (io.Reader, error)
 	}
+}
+
+func (d DecompressorV1Bridge) Decompress(in [][]byte, provider encoding.BufferProvider) (out [][]byte, err error) {
+	//TODO implement me
+	panic("implement me")
 }
