@@ -34,7 +34,6 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/internal/pretty"
@@ -1113,7 +1112,7 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
-func (t *http2Server) Write(s *Stream, hdr []byte, data encoding.BufferSeq, opts *Options) error {
+func (t *http2Server) Write(s *Stream, hdr []byte, data [][]byte, opts *Options) error {
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		if err := t.WriteHeader(s, nil); err != nil {
 			return err
@@ -1128,7 +1127,7 @@ func (t *http2Server) Write(s *Stream, hdr []byte, data encoding.BufferSeq, opts
 	df := &dataFrame{
 		streamID:    s.id,
 		h:           hdr,
-		d:           newBufferSeqReader(data),
+		d:           newBufferSliceReader(data),
 		onEachWrite: t.setResetPingStrikes,
 	}
 	if err := s.wq.get(int32(len(hdr) + df.d.remaining())); err != nil {

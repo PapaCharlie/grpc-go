@@ -1,37 +1,8 @@
 package encoding
 
 import (
-	internalencoding "google.golang.org/grpc/internal"
+	"io"
 )
-
-type Buffer interface {
-	Data() []byte
-	Free()
-}
-
-// TODO(PapaCharlie): Move grpc.SharedBufferPool to separate package to make it
-// importable without introducing import cycle.
-var globalBufferPool = internalencoding.NewSimpleSharedBufferPool()
-
-type buffer struct {
-	data []byte
-}
-
-func (b *buffer) Data() []byte {
-	return b.data
-}
-
-func (b *buffer) Free() {
-	if b.data != nil {
-		ClearBuffer(b.data)
-		globalBufferPool.Put(&b.data)
-		b.data = nil
-	}
-}
-
-func NewBuffer(size int) Buffer {
-	return &buffer{data: globalBufferPool.Get(size)}
-}
 
 func ClearBuffer(buf []byte) {
 	// TODO: replace with clear when go1.21 is supported: clear(buf)
@@ -40,53 +11,85 @@ func ClearBuffer(buf []byte) {
 	}
 }
 
-type simpleBuffer struct {
-	data []byte
+type BufferProvider interface {
+	GetBuffer(size int) []byte
+	ReturnBuffer([]byte)
 }
 
-func (s *simpleBuffer) Data() []byte {
-	return s.data
+type sliceWriter struct {
+	buffers  *[][]byte
+	provider BufferProvider
 }
 
-func (s *simpleBuffer) Free() {}
-
-func SimpleBuffer(data []byte) Buffer {
-	return &simpleBuffer{data}
+func (s *sliceWriter) appendNewBuffer(size int) []byte {
+	buf := newBuffer(size, s.provider)
+	*s.buffers = append(*s.buffers, buf)
+	return buf
 }
 
-// BufferSeq is the equivalent of [iter.Seq][[Buffer]], but cannot be added by
-// directly referencing the new [iter] package since it is not yet supported in
-// all versions of go supported by grpc-go.
-type BufferSeq []Buffer
+func (s *sliceWriter) Write(p []byte) (n int, err error) {
+	n = len(p)
 
-func (s BufferSeq) Size() (i int) {
-	for _, b := range s {
-		i += len(b.Data())
+	lastIdx := len(*s.buffers) - 1
+	var lastBuffer []byte
+	if lastIdx != -1 {
+		lastBuffer = (*s.buffers)[lastIdx]
 	}
-	return i
-}
 
-func (s BufferSeq) Free() {
-	for _, b := range s {
-		b.Free()
+	if lastIdx == -1 || cap(lastBuffer) == len(lastBuffer) {
+		lastBuffer = s.appendNewBuffer(len(p))
+		lastIdx++
 	}
+
+	if availableCapacity := cap(lastBuffer) - len(lastBuffer); availableCapacity < len(p) {
+		p = p[copy(lastBuffer[len(lastBuffer):cap(lastBuffer)], p):]
+		(*s.buffers)[lastIdx] = lastBuffer[:cap(lastBuffer)]
+
+		lastBuffer = s.appendNewBuffer(len(p) - availableCapacity)
+		lastIdx++
+	}
+
+	(*s.buffers)[lastIdx] = append(lastBuffer, p...)
+
+	return n, nil
 }
 
-func (s BufferSeq) Concat(provider BufferProvider) Buffer {
+func BufferSliceWriter(buffers *[][]byte, provider BufferProvider) io.Writer {
+	return &sliceWriter{buffers: buffers, provider: provider}
+}
+
+func BufferSliceSize(buffers [][]byte) (l int) {
+	for _, b := range buffers {
+		l += len(b)
+	}
+	return l
+}
+
+func ConcatBuffersSlice(buffers [][]byte, provider BufferProvider) []byte {
 	// If the entire data was received in one buffer, avoid copying altogether and use that one directly
-	if len(s) == 1 {
-		return s[0]
+	if len(buffers) == 1 {
+		return buffers[0]
 	} else {
 		// Otherwise, materialize the buffer
-		buf := provider(s.Size())
+		buf := newBuffer(BufferSliceSize(buffers), provider)
+		if provider == nil {
+			buf = make([]byte, BufferSliceSize(buffers))
+		} else {
+			buf = provider.GetBuffer(BufferSliceSize(buffers))
+		}
 		idx := 0
-		for _, b := range s {
-			idx += copy(buf.Data()[idx:], b.Data())
-			b.Free()
+		for _, b := range buffers {
+			idx += copy(buf[idx:], b)
 		}
 
 		return buf
 	}
 }
 
-type BufferProvider = func(int) Buffer
+func newBuffer(size int, provider BufferProvider) []byte {
+	if provider == nil {
+		return make([]byte, size)
+	} else {
+		return provider.GetBuffer(size)
+	}
+}

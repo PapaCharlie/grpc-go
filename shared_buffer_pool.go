@@ -30,15 +30,7 @@ import (
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
-type SharedBufferPool interface {
-	// Get returns a buffer with specified length from the pool.
-	//
-	// The returned byte slice may be not zero initialized.
-	Get(length int) []byte
-
-	// Put returns a buffer to the pool.
-	Put(*[]byte)
-}
+type SharedBufferPool = internalencoding.SharedBufferPool
 
 // NewSharedBufferPool creates a simple SharedBufferPool with buckets
 // of different sizes to optimize memory usage. This prevents the pool from
@@ -49,7 +41,7 @@ type SharedBufferPool interface {
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
 func NewSharedBufferPool() SharedBufferPool {
-	return internalencoding.NewSimpleSharedBufferPool()
+	return internalencoding.NewSharedBufferPool()
 }
 
 // nopBufferPool is a buffer pool just makes new buffer without pooling.

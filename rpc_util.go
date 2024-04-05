@@ -614,7 +614,7 @@ func (p *parser) recvMsg(
 	c internalencoding.BaseCodecV2,
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
-) (pf payloadFormat, msg encoding.BufferSeq, err error) {
+) (pf payloadFormat, _ [][]byte, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -632,40 +632,49 @@ func (p *parser) recvMsg(
 		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
 	}
 
-	var provider encoding.BufferProvider
-	// Choose the appropriate BufferProvider based on whether the message was
-	// compressed. If the message wasn't compressed it's important to use the codec's
-	// buffer provider so the codec can maximize buffer reuse.
-	if pf == compressionMade {
-		provider = dc.GetBuffer
-	} else {
-		provider = c.GetBuffer
-	}
-
 	// TODO(PapaCharlie): Instead of allocating one large buffer and copying the
 	// bytes off of the wire into it, maybe this should be done at the HTTP/2 frame
 	// level directly, and the io.Reader API should be avoided.
-	buf := provider(int(length))
-	if _, err := p.r.Read(buf.Data()); err != nil {
+	var msg []byte
+
+	// Choose the appropriate BufferProvider based on whether the message was
+	// compressed. If the message wasn't compressed it's important to use the codec's
+	// buffer provider so the codec can maximize buffer reuse.
+	var provider encoding.BufferProvider
+	if pf == compressionMade {
+		provider, _ = dc.(encoding.BufferProvider)
+	} else {
+		provider, _ = c.(encoding.BufferProvider)
+	}
+
+	if provider != nil {
+		msg = provider.GetBuffer(int(length))
+	} else {
+		// If the corresponding objects don't implement the BufferProvider interface,
+		// fall back to the configured recvBufferPool.
+		msg = p.recvBufferPool.Get(int(length))
+	}
+
+	if _, err := p.r.Read(msg); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return 0, nil, err
 	}
 
-	return pf, msg, nil
+	return pf, [][]byte{msg}, nil
 }
 
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c internalencoding.BaseCodecV2, msg any) (encoding.BufferSeq, error) {
+func encode(c internalencoding.BaseCodecV2, msg any) ([][]byte, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
 	data, err := c.Marshal(msg)
-	if uint(data.Size()) > math.MaxUint32 {
-		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", data.Size())
+	if size := encoding.BufferSliceSize(data); uint(size) > math.MaxUint32 {
+		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", size)
 	}
 
 	if err != nil {
@@ -678,8 +687,8 @@ func encode(c internalencoding.BaseCodecV2, msg any) (encoding.BufferSeq, error)
 // compress returns the input bytes compressed by compressor or cp.
 // If both compressors are nil, or if the message has zero length, returns nil,
 // indicating no compression was done.
-func compress(in encoding.BufferSeq, cp internalencoding.BaseCompressorV2) (encoding.BufferSeq, error) {
-	if cp == nil || in.Size() == 0 {
+func compress(in [][]byte, cp internalencoding.BaseCompressorV2) ([][]byte, error) {
+	if cp == nil || encoding.BufferSliceSize(in) == 0 {
 		return nil, nil
 	}
 
@@ -698,7 +707,7 @@ const (
 
 // msgHeader returns a 5-byte header for the message being transmitted and the
 // payload, which is compData if non-nil or data otherwise.
-func msgHeader(data, compData encoding.BufferSeq) (hdr []byte, payload encoding.BufferSeq) {
+func msgHeader(data, compData [][]byte) (hdr []byte, payload [][]byte) {
 	hdr = make([]byte, headerLen)
 	if compData != nil {
 		hdr[0] = byte(compressionMade)
@@ -708,7 +717,7 @@ func msgHeader(data, compData encoding.BufferSeq) (hdr []byte, payload encoding.
 	}
 
 	// Write length of payload into buf
-	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(data.Size()))
+	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(encoding.BufferSliceSize(data)))
 	return hdr, data
 }
 
@@ -742,7 +751,7 @@ func checkRecvPayload(pf payloadFormat, recvCompress string, haveCompressor bool
 
 type payloadInfo struct {
 	compressedLength  int // The compressed length got from wire.
-	uncompressedBytes encoding.BufferSeq
+	uncompressedBytes [][]byte
 }
 
 // recvAndDecompress reads a message from the stream, decompressing it if necessary.
@@ -753,7 +762,7 @@ func recvAndDecompress(
 	dc internalencoding.BaseDecompressorV2,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
-) (uncompressed encoding.BufferSeq, err error) {
+) (uncompressed [][]byte, err error) {
 	pf, compressed, err := p.recvMsg(c, dc, maxReceiveMessageSize)
 	if err != nil {
 		return nil, err
@@ -768,8 +777,7 @@ func recvAndDecompress(
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
 		}
-		if size := uncompressed.Size(); size > maxReceiveMessageSize {
-			uncompressed.Free()
+		if size := encoding.BufferSliceSize(uncompressed); size > maxReceiveMessageSize {
 			// TODO: Revisit the error code. Currently keep it consistent with java
 			// implementation.
 			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
@@ -779,7 +787,7 @@ func recvAndDecompress(
 	}
 
 	if payInfo != nil {
-		payInfo.compressedLength = compressed.Size()
+		payInfo.compressedLength = encoding.BufferSliceSize(compressed)
 		payInfo.uncompressedBytes = uncompressed
 	}
 

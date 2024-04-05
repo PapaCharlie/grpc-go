@@ -4,7 +4,25 @@ import (
 	"sync"
 )
 
-func NewSimpleSharedBufferPool() *SimpleSharedBufferPool {
+// SharedBufferPool is a pool of buffers that can be shared, resulting in
+// decreased memory allocation. Currently, in gRPC-go, it is only utilized
+// for parsing incoming messages.
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+type SharedBufferPool interface {
+	// Get returns a buffer with specified length from the pool.
+	//
+	// The returned byte slice may be not zero initialized.
+	Get(length int) []byte
+
+	// Put returns a buffer to the pool.
+	Put(*[]byte)
+}
+
+func NewSharedBufferPool() SharedBufferPool {
 	return &SimpleSharedBufferPool{
 		pools: [poolArraySize]simpleSharedBufferChildPool{
 			newBytesPool(level0PoolMaxSize),

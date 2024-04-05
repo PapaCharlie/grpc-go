@@ -20,7 +20,6 @@ package grpc
 
 import (
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/status"
 )
 
@@ -32,9 +31,9 @@ import (
 // later release.
 type PreparedMsg struct {
 	// Struct for preparing msg before sending them
-	encodedData encoding.BufferSeq
+	encodedData [][]byte
 	hdr         []byte
-	payload     encoding.BufferSeq
+	payload     [][]byte
 }
 
 // Encode marshalls and compresses the message using the codec and compressor for the stream.

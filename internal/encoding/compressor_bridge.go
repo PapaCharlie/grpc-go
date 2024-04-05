@@ -8,7 +8,7 @@ import (
 )
 
 type BaseCompressorV2 interface {
-	Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error)
+	Compress(in [][]byte) (out [][]byte, err error)
 }
 
 type CompressorV0Bridge struct {
@@ -17,16 +17,13 @@ type CompressorV0Bridge struct {
 	}
 }
 
-func (c CompressorV0Bridge) Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error) {
-	data := in.Concat(encoding.NewBuffer)
-	defer data.Free()
-
+func (c CompressorV0Bridge) Compress(in [][]byte) (out [][]byte, err error) {
 	buf := new(bytes.Buffer)
-	err = c.Compressor.Do(buf, data.Data())
+	err = c.Compressor.Do(buf, encoding.ConcatBuffersSlice(in, nil))
 	if err != nil {
 		return nil, err
 	}
-	return encoding.BufferSeq{encoding.SimpleBuffer(buf.Bytes())}, nil
+	return [][]byte{buf.Bytes()}, nil
 }
 
 type CompressorV1Bridge struct {
@@ -35,30 +32,14 @@ type CompressorV1Bridge struct {
 	}
 }
 
-type seqWriter encoding.BufferSeq
-
-func (s *seqWriter) Write(data []byte) (int, error) {
-	buf := encoding.NewBuffer(len(data))
-	copy(buf.Data(), data)
-	*s = append(*s, buf)
-	return len(data), nil
-}
-
-func (c CompressorV1Bridge) Compress(in encoding.BufferSeq) (out encoding.BufferSeq, err error) {
-	defer func() {
-		if err != nil {
-			out.Free()
-		}
-	}()
-
-	w, err := c.Compressor.Compress((*seqWriter)(&out))
+func (c CompressorV1Bridge) Compress(in [][]byte) (out [][]byte, err error) {
+	w, err := c.Compressor.Compress(encoding.BufferSliceWriter(&out, nil))
 	if err != nil {
 		return nil, err
 	}
 
 	for _, b := range in {
-		_, err = w.Write(b.Data())
-		b.Free()
+		_, err = w.Write(b)
 		if err != nil {
 			return nil, err
 		}
@@ -73,8 +54,7 @@ func (c CompressorV1Bridge) Compress(in encoding.BufferSeq) (out encoding.Buffer
 }
 
 type BaseDecompressorV2 interface {
-	GetBuffer(length int) encoding.Buffer
-	Decompress(in encoding.BufferSeq) (out encoding.BufferSeq, err error)
+	Decompress(in [][]byte) (out [][]byte, err error)
 }
 
 type DecompressorV0Bridge struct {

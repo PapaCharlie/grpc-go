@@ -149,7 +149,7 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	h         []byte
-	d         *bufferSeqReader
+	d         *bufferSliceReader
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -1009,33 +1009,32 @@ func min(a, b int) int {
 	return b
 }
 
-type bufferSeqReader struct {
-	seq      encoding.BufferSeq
+type bufferSliceReader struct {
+	data     [][]byte
 	len, idx int
 }
 
-func newBufferSeqReader(data encoding.BufferSeq) *bufferSeqReader {
-	return &bufferSeqReader{
-		seq: data,
-		len: data.Size(),
+func newBufferSliceReader(data [][]byte) *bufferSliceReader {
+	return &bufferSliceReader{
+		data: data,
+		len:  encoding.BufferSliceSize(data),
 	}
 }
 
-func (r *bufferSeqReader) remaining() int {
+func (r *bufferSliceReader) remaining() int {
 	return r.len - r.idx
 }
 
-func (r *bufferSeqReader) read(buf []byte) {
+func (r *bufferSliceReader) read(buf []byte) {
 	for len(buf) != 0 && r.len != 0 {
-		data := r.seq[0]
-		copied := copy(buf, data.Data()[r.idx:])
+		data := r.data[0]
+		copied := copy(buf, data[r.idx:])
 		r.len -= copied
 
 		buf = buf[copied:]
 
-		if copied == len(data.Data()) {
-			data.Free()
-			r.seq = r.seq[1:]
+		if copied == len(data) {
+			r.data = r.data[1:]
 			r.idx = 0
 		} else {
 			r.idx += copied

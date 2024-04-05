@@ -5,9 +5,8 @@ import (
 )
 
 type BaseCodecV2 interface {
-	Marshal(v any) (encoding.BufferSeq, error)
-	GetBuffer(length int) encoding.Buffer
-	Unmarshal(v any, data encoding.BufferSeq) error
+	Marshal(v any) ([][]byte, error)
+	Unmarshal(v any, data [][]byte) error
 }
 
 type CodecV1Bridge struct {
@@ -17,23 +16,17 @@ type CodecV1Bridge struct {
 	}
 }
 
-func (c CodecV1Bridge) Marshal(v any) (encoding.BufferSeq, error) {
+func (c CodecV1Bridge) Marshal(v any) ([][]byte, error) {
 	data, err := c.Codec.Marshal(v)
 	if err != nil {
 		return nil, err
 	} else {
-		return encoding.BufferSeq{encoding.SimpleBuffer(data)}, nil
+		return [][]byte{data}, nil
 	}
 }
 
-func (c CodecV1Bridge) GetBuffer(length int) encoding.Buffer {
-	return encoding.NewBuffer(length)
-}
-
-func (c CodecV1Bridge) Unmarshal(v any, data encoding.BufferSeq) (err error) {
-	buf := data.Concat(encoding.NewBuffer)
-	defer buf.Free()
-	return c.Codec.Unmarshal(buf.Data(), v)
+func (c CodecV1Bridge) Unmarshal(v any, data [][]byte) (err error) {
+	return c.Codec.Unmarshal(encoding.ConcatBuffersSlice(data, nil), v)
 }
 
 func GetCodec(name string) BaseCodecV2 {
