@@ -33,8 +33,8 @@ import (
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/balancerload"
 	"google.golang.org/grpc/internal/binarylog"
+	"google.golang.org/grpc/internal/bridge"
 	"google.golang.org/grpc/internal/channelz"
-	internalencoding "google.golang.org/grpc/internal/encoding"
 	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/internal/grpcutil"
 	imetadata "google.golang.org/grpc/internal/metadata"
@@ -300,18 +300,17 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 	// set.  In that case, also find the compressor from the encoding package.
 	// Otherwise, use the compressor configured by the WithCompressor DialOption,
 	// if set.
-	var cp Compressor
-	var comp encoding.Compressor
+	var cp bridge.BaseCompressorV2
 	if ct := c.compressorType; ct != "" {
 		callHdr.SendCompress = ct
 		if ct != encoding.Identity {
-			comp = encoding.GetCompressor(ct)
-			if comp == nil {
+			cp = bridge.GetCompressor(ct)
+			if cp == nil {
 				return nil, status.Errorf(codes.Internal, "grpc: Compressor is not installed for requested grpc-encoding %q", ct)
 			}
 		}
 	} else if cc.dopts.cp != nil {
-		callHdr.SendCompress = cc.dopts.cp.Type()
+		callHdr.SendCompress = cc.dopts.cp.Name()
 		cp = cc.dopts.cp
 	}
 	if c.creds != nil {
@@ -327,7 +326,7 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 		cc:           cc,
 		desc:         desc,
 		codec:        c.codec,
-		cp:           newCompressorV2(cp, comp),
+		cp:           cp,
 		cancel:       cancel,
 		firstAttempt: true,
 		onCommit:     onCommit,
@@ -528,8 +527,8 @@ type clientStream struct {
 	cc       *ClientConn
 	desc     *StreamDesc
 
-	codec internalencoding.BaseCodecV2
-	cp    internalencoding.BaseCompressorV2
+	codec bridge.BaseCodecV2
+	cp    bridge.BaseCompressorV2
 
 	cancel context.CancelFunc // cancels all attempts
 
@@ -580,9 +579,9 @@ type csAttempt struct {
 	p          *parser
 	pickResult balancer.PickResult
 
-	finished  bool
-	dc        internalencoding.BaseDecompressorV2
-	decompSet bool
+	finished bool
+	dc       bridge.BaseDecompressorV2
+	dcSet    bool
 
 	mu sync.Mutex // guards trInfo.tr
 	// trInfo may be nil (if EnableTracing is false).
@@ -1031,7 +1030,7 @@ func (cs *clientStream) finish(err error) {
 	cs.cancel()
 }
 
-func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data encoding.BufferSeq) error {
+func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data [][]byte) error {
 	cs := a.cs
 	if a.trInfo != nil {
 		a.mu.Lock()
@@ -1064,21 +1063,20 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		payInfo = &payloadInfo{}
 	}
 
-	if !a.decompSet {
+	if !a.dcSet {
 		// Block until we receive headers containing received message encoding.
 		if ct := a.s.RecvCompress(); ct != "" && ct != encoding.Identity {
-			if a.dc == nil || a.dc.Type() != ct {
+			if a.dc == nil || a.dc.Name() != ct {
 				// No configured decompressor, or it does not match the incoming
 				// message encoding; attempt to find a registered compressor that does.
-				a.dc = nil
-				a.decomp = encoding.GetCompressor(ct)
+				a.dc = bridge.GetDecompressor(ct)
 			}
 		} else {
 			// No compression is used; disable our decompressor.
 			a.dc = nil
 		}
 		// Only initialize this state once per stream.
-		a.decompSet = true
+		a.dcSet = true
 	}
 	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, payInfo)
 	if err != nil {
@@ -1099,7 +1097,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		a.mu.Unlock()
 	}
 	if len(a.statsHandlers) != 0 {
-		data := encoding.ConcatBufferSlice(unwrapBufferSlice(payInfo.uncompressedBytes), nil)
+		data := encoding.MaterializeBufferSlice(unwrapBufferSlice(payInfo.uncompressedBytes))
 		for _, sh := range a.statsHandlers {
 			sh.HandleRPC(a.ctx, &stats.InPayload{
 				Client:   true,
@@ -1237,18 +1235,17 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 	// set.  In that case, also find the compressor from the encoding package.
 	// Otherwise, use the compressor configured by the WithCompressor DialOption,
 	// if set.
-	var cp Compressor
-	var comp encoding.Compressor
+	var cp bridge.BaseCompressorV2
 	if ct := c.compressorType; ct != "" {
 		callHdr.SendCompress = ct
 		if ct != encoding.Identity {
-			comp = encoding.GetCompressor(ct)
-			if comp == nil {
+			cp = bridge.GetCompressor(ct)
+			if cp == nil {
 				return nil, status.Errorf(codes.Internal, "grpc: Compressor is not installed for requested grpc-encoding %q", ct)
 			}
 		}
 	} else if ac.cc.dopts.cp != nil {
-		callHdr.SendCompress = ac.cc.dopts.cp.Type()
+		callHdr.SendCompress = ac.cc.dopts.cp.Name()
 		cp = ac.cc.dopts.cp
 	}
 	if c.creds != nil {
@@ -1266,7 +1263,6 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 		desc:     desc,
 		codec:    c.codec,
 		cp:       cp,
-		comp:     comp,
 		t:        t,
 	}
 
@@ -1312,10 +1308,10 @@ type addrConnStream struct {
 	ctx       context.Context
 	sentLast  bool
 	desc      *StreamDesc
-	codec     internalencoding.BaseCodecV2
-	cp        internalencoding.BaseCompressorV2
+	codec     bridge.BaseCodecV2
+	cp        bridge.BaseCompressorV2
 	decompSet bool
-	dc        internalencoding.BaseDecompressorV2
+	dc        bridge.BaseDecompressorV2
 	p         *parser
 	mu        sync.Mutex
 	finished  bool
@@ -1408,11 +1404,10 @@ func (as *addrConnStream) RecvMsg(m any) (err error) {
 	if !as.decompSet {
 		// Block until we receive headers containing received message encoding.
 		if ct := as.s.RecvCompress(); ct != "" && ct != encoding.Identity {
-			if as.dc == nil || as.dc.Type() != ct {
+			if as.dc == nil || as.dc.Name() != ct {
 				// No configured decompressor, or it does not match the incoming
 				// message encoding; attempt to find a registered compressor that does.
-				as.dc = nil
-				as.decomp = encoding.GetCompressor(ct)
+				as.dc = bridge.GetDecompressor(ct)
 			}
 		} else {
 			// No compression is used; disable our decompressor.
@@ -1421,7 +1416,7 @@ func (as *addrConnStream) RecvMsg(m any) (err error) {
 		// Only initialize this state once per stream.
 		as.decompSet = true
 	}
-	err = recv(as.p, as.codec, as.s, as.dc, m, *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
+	err = recv(as.p, as.codec, as.s, as.dc, m, *as.callInfo.maxReceiveMessageSize, nil)
 	if err != nil {
 		if err == io.EOF {
 			if statusErr := as.s.Status().Err(); statusErr != nil {
@@ -1442,7 +1437,7 @@ func (as *addrConnStream) RecvMsg(m any) (err error) {
 
 	// Special handling for non-server-stream rpcs.
 	// This recv expects EOF or errors, so we don't collect inPayload.
-	err = recv(as.p, as.codec, as.s, as.dc, m, *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
+	err = recv(as.p, as.codec, as.s, as.dc, m, *as.callInfo.maxReceiveMessageSize, nil)
 	if err == nil {
 		return toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
 	}
@@ -1534,12 +1529,10 @@ type serverStream struct {
 	t     transport.ServerTransport
 	s     *transport.Stream
 	p     *parser
-	codec baseCodec
+	codec bridge.BaseCodecV2
 
-	cp     Compressor
-	dc     Decompressor
-	comp   encoding.Compressor
-	decomp encoding.Compressor
+	cp bridge.BaseCompressorV2
+	dc bridge.BaseDecompressorV2
 
 	sendCompressorName string
 
@@ -1638,12 +1631,12 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	// Server handler could have set new compressor by calling SetSendCompressor.
 	// In case it is set, we need to use it for compressing outbound message.
 	if sendCompressorsName := ss.s.SendCompress(); sendCompressorsName != ss.sendCompressorName {
-		ss.comp = encoding.GetCompressor(sendCompressorsName)
+		ss.cp = bridge.GetCompressor(sendCompressorsName)
 		ss.sendCompressorName = sendCompressorsName
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp)
+	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp)
 	if err != nil {
 		return err
 	}
@@ -1713,7 +1706,7 @@ func (ss *serverStream) RecvMsg(m any) (err error) {
 	if len(ss.statsHandler) != 0 || len(ss.binlogs) != 0 {
 		payInfo = &payloadInfo{}
 	}
-	if err := recv(ss.p, ss.codec, ss.s, ss.dc, m, ss.maxReceiveMessageSize, payInfo, ss.decomp); err != nil {
+	if err := recv(ss.p, ss.codec, ss.s, ss.dc, m, ss.maxReceiveMessageSize, payInfo); err != nil {
 		if err == io.EOF {
 			if len(ss.binlogs) != 0 {
 				chc := &binarylog.ClientHalfClose{}
@@ -1761,7 +1754,7 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // prepareMsg returns the hdr, payload and data
 // using the compressors passed or using the
 // passed preparedmsg
-func prepareMsg(m any, codec internalencoding.BaseCodecV2, cp internalencoding.BaseCompressorV2) (hdr []byte, payload, data encoding.BufferSeq, err error) {
+func prepareMsg(m any, codec bridge.BaseCodecV2, cp bridge.BaseCompressorV2) (hdr []byte, payload, data [][]byte, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.payload, preparedMsg.encodedData, nil
 	}

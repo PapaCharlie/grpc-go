@@ -149,7 +149,7 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	h         []byte
-	d         *bufferSliceReader
+	d         encoding.BufferSliceReader
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -911,7 +911,7 @@ func (l *loopyWriter) processData() (bool, error) {
 	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
 	// maximum possible HTTP2 frame size.
 
-	if len(dataItem.h) == 0 && dataItem.d.remaining() == 0 { // Empty data frame
+	if len(dataItem.h) == 0 && dataItem.d.Len() == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
 		if err := l.framer.fr.WriteData(dataItem.streamID, dataItem.endStream, nil); err != nil {
 			return false, err
@@ -945,8 +945,8 @@ func (l *loopyWriter) processData() (bool, error) {
 	}
 	// Compute how much of the header and data we can send within quota and max frame length
 	hSize := min(maxSize, len(dataItem.h))
-	dSize := min(maxSize-hSize, dataItem.d.remaining())
-	remainingBytes := len(dataItem.h) + dataItem.d.remaining() - hSize - dSize
+	dSize := min(maxSize-hSize, dataItem.d.Len())
+	remainingBytes := len(dataItem.h) + dataItem.d.Len() - hSize - dSize
 
 	var buf []byte
 
@@ -959,7 +959,7 @@ func (l *loopyWriter) processData() (bool, error) {
 		defer bufPool.Put(buf)
 
 		copy(buf[:hSize], dataItem.h)
-		dataItem.d.read(buf[hSize:])
+		_, _ = dataItem.d.Read(buf[hSize:])
 		buf = buf[:hSize+dSize]
 	}
 

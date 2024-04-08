@@ -57,15 +57,16 @@ func (c *codecV2) Marshal(v any) ([][]byte, error) {
 	}
 }
 
-func (c *codecV2) Unmarshal(v any, data [][]byte) (err error) {
+func (c *codecV2) Unmarshal(data [][]byte, v any) (err error) {
 	vv := messageV2Of(v)
 	if vv == nil {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	buf := encoding.ConcatBufferSlice(data, c)
+	buf := c.GetBuffer(encoding.BufferSliceSize(data))
 	defer c.ReturnBuffer(buf)
-
+	encoding.WriteBufferSlice(data, buf)
+	// TODO: Upgrade proto.Unmarshal to support [][]byte
 	return proto.Unmarshal(buf, vv)
 }
 

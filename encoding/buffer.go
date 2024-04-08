@@ -4,17 +4,18 @@ import (
 	"io"
 )
 
-func ClearBuffer(buf []byte) {
-	// TODO: replace with clear when go1.21 is supported: clear(buf)
-	for i := range buf {
-		buf[i] = 0
-	}
-}
-
 type BufferProvider interface {
 	GetBuffer(size int) []byte
 	ReturnBuffer([]byte)
 }
+
+type NoopBufferProvider struct{}
+
+func (n NoopBufferProvider) GetBuffer(size int) []byte {
+	return make([]byte, size)
+}
+
+func (n NoopBufferProvider) ReturnBuffer(bytes []byte) {}
 
 type sliceWriter struct {
 	buffers  *[][]byte
@@ -22,7 +23,7 @@ type sliceWriter struct {
 }
 
 func (s *sliceWriter) appendNewBuffer(size int) []byte {
-	buf := newBuffer(size, s.provider)
+	buf := s.provider.GetBuffer(size)
 	*s.buffers = append(*s.buffers, buf)
 	return buf
 }
@@ -54,7 +55,7 @@ func (s *sliceWriter) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func BufferSliceWriter(buffers *[][]byte, provider BufferProvider) io.Writer {
+func NewBufferSliceWriter(buffers *[][]byte, provider BufferProvider) io.Writer {
 	return &sliceWriter{buffers: buffers, provider: provider}
 }
 
@@ -65,31 +66,61 @@ func BufferSliceSize(buffers [][]byte) (l int) {
 	return l
 }
 
-func ConcatBufferSlice(buffers [][]byte, provider BufferProvider, alwaysCopy bool) []byte {
-	// If the entire data was received in one buffer, avoid copying altogether and use that one directly
-	if len(buffers) == 1 && !alwaysCopy {
-		return buffers[0]
-	} else {
-		// Otherwise, materialize the buffer
-		buf := newBuffer(BufferSliceSize(buffers), provider)
-		if provider == nil {
-			buf = make([]byte, BufferSliceSize(buffers))
-		} else {
-			buf = provider.GetBuffer(BufferSliceSize(buffers))
-		}
-		idx := 0
-		for _, b := range buffers {
-			idx += copy(buf[idx:], b)
-		}
-
-		return buf
+func WriteBufferSlice(buffers [][]byte, out []byte) {
+	out = out[:0]
+	for _, b := range buffers {
+		out = append(out, b...)
 	}
 }
 
-func newBuffer(size int, provider BufferProvider) []byte {
-	if provider == nil {
-		return make([]byte, size)
-	} else {
-		return provider.GetBuffer(size)
+func MaterializeBufferSlice(buffers [][]byte) []byte {
+	buf := make([]byte, 0, BufferSliceSize(buffers))
+	WriteBufferSlice(buffers, buf)
+	return buf
+}
+
+type BufferSliceReader struct {
+	data     [][]byte
+	len, idx int
+}
+
+func (r *BufferSliceReader) Len() int {
+	return r.len - r.idx
+}
+
+func (r *BufferSliceReader) Read(buf []byte) (n int, _ error) {
+	for len(buf) != 0 && r.len != 0 {
+		data := r.data[0]
+		copied := copy(buf, data[r.idx:])
+		r.len -= copied
+
+		buf = buf[copied:]
+
+		if copied == len(data) {
+			r.data = r.data[1:]
+			r.idx = 0
+		} else {
+			r.idx += copied
+		}
+		n += copied
+	}
+
+	if n == 0 {
+		return 0, io.EOF
+	}
+
+	return n, nil
+}
+
+func NewBufferSliceReader(data [][]byte) *BufferSliceReader {
+	return &BufferSliceReader{
+		data: data,
+		len:  BufferSliceSize(data),
+	}
+}
+
+func ReturnAllBuffers(data [][]byte, provider BufferProvider) {
+	for _, b := range data {
+		provider.ReturnBuffer(b)
 	}
 }

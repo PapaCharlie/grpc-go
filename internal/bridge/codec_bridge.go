@@ -1,12 +1,13 @@
-package internalencoding
+package bridge
 
 import (
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/internal"
 )
 
 type BaseCodecV2 interface {
 	Marshal(v any) ([][]byte, error)
-	Unmarshal(v any, data [][]byte) error
+	Unmarshal(data [][]byte, v any) error
 }
 
 type CodecV1Bridge struct {
@@ -14,6 +15,14 @@ type CodecV1Bridge struct {
 		Marshal(v any) ([]byte, error)
 		Unmarshal(data []byte, v any) error
 	}
+}
+
+func (c CodecV1Bridge) GetBuffer(size int) []byte {
+	return pool.GetBuffer(size)
+}
+
+func (c CodecV1Bridge) ReturnBuffer(buf []byte) {
+	pool.ReturnBuffer(buf)
 }
 
 func (c CodecV1Bridge) Marshal(v any) ([][]byte, error) {
@@ -25,8 +34,13 @@ func (c CodecV1Bridge) Marshal(v any) ([][]byte, error) {
 	}
 }
 
-func (c CodecV1Bridge) Unmarshal(v any, data [][]byte) (err error) {
-	return c.Codec.Unmarshal(encoding.ConcatBufferSlice(data, nil), v)
+var pool = internal.NewSharedBufferPool()
+
+func (c CodecV1Bridge) Unmarshal(data [][]byte, v any) (err error) {
+	buf := pool.GetBuffer(encoding.BufferSliceSize(data))
+	defer pool.ReturnBuffer(buf)
+	encoding.WriteBufferSlice(data, buf)
+	return c.Codec.Unmarshal(buf, v)
 }
 
 func GetCodec(name string) BaseCodecV2 {

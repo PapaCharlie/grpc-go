@@ -19,7 +19,7 @@
 package grpc
 
 import (
-	internalencoding "google.golang.org/grpc/internal"
+	"google.golang.org/grpc/internal"
 )
 
 // SharedBufferPool is a pool of buffers that can be shared, resulting in
@@ -30,7 +30,7 @@ import (
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
-type SharedBufferPool = internalencoding.SharedBufferPool
+type SharedBufferPool = internal.SharedBufferPool
 
 // NewSharedBufferPool creates a simple SharedBufferPool with buckets
 // of different sizes to optimize memory usage. This prevents the pool from
@@ -41,7 +41,7 @@ type SharedBufferPool = internalencoding.SharedBufferPool
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
 func NewSharedBufferPool() SharedBufferPool {
-	return internalencoding.NewSharedBufferPool()
+	return internal.NewSharedBufferPool()
 }
 
 // nopBufferPool is a buffer pool just makes new buffer without pooling.

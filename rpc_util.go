@@ -33,7 +33,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/encoding/proto"
-	internalencoding "google.golang.org/grpc/internal/encoding"
+	"google.golang.org/grpc/internal/bridge"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -157,7 +157,7 @@ type callInfo struct {
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
 	contentSubtype        string
-	codec                 internalencoding.BaseCodecV2
+	codec                 bridge.BaseCodecV2
 	maxRetryRPCBufferSize int
 	onFinish              []func(err error)
 }
@@ -515,7 +515,7 @@ type ForceCodecCallOption struct {
 }
 
 func (o ForceCodecCallOption) before(c *callInfo) error {
-	c.codec = internalencoding.CodecV1Bridge{Codec: o.Codec}
+	c.codec = bridge.CodecV1Bridge{Codec: o.Codec}
 	return nil
 }
 func (o ForceCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -540,7 +540,7 @@ type CustomCodecCallOption struct {
 }
 
 func (o CustomCodecCallOption) before(c *callInfo) error {
-	c.codec = internalencoding.CodecV1Bridge{o.Codec}
+	c.codec = bridge.CodecV1Bridge{Codec: o.Codec}
 	return nil
 }
 func (o CustomCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -611,8 +611,8 @@ type parser struct {
 // that the underlying io.Reader must not return an incompatible
 // error.
 func (p *parser) recvMsg(
-	c internalencoding.BaseCodecV2,
-	dc internalencoding.BaseDecompressorV2,
+	c bridge.BaseCodecV2,
+	dc bridge.BaseDecompressorV2,
 	maxReceiveMessageSize int,
 ) (pf payloadFormat, _ []*buffer, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
@@ -669,7 +669,7 @@ func (p *parser) recvMsg(
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c internalencoding.BaseCodecV2, msg any) ([][]byte, error) {
+func encode(c bridge.BaseCodecV2, msg any) ([][]byte, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
@@ -688,7 +688,7 @@ func encode(c internalencoding.BaseCodecV2, msg any) ([][]byte, error) {
 // compress returns the input bytes compressed by compressor or cp.
 // If both compressors are nil, or if the message has zero length, returns nil,
 // indicating no compression was done.
-func compress(in [][]byte, cp internalencoding.BaseCompressorV2) ([][]byte, error) {
+func compress(in [][]byte, cp bridge.BaseCompressorV2) ([][]byte, error) {
 	if cp == nil || encoding.BufferSliceSize(in) == 0 {
 		return nil, nil
 	}
@@ -759,8 +759,8 @@ type payloadInfo struct {
 func recvAndDecompress(
 	p *parser,
 	s *transport.Stream,
-	c internalencoding.BaseCodecV2,
-	dc internalencoding.BaseDecompressorV2,
+	c bridge.BaseCodecV2,
+	dc bridge.BaseDecompressorV2,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
 ) (out []*buffer, er error) {
@@ -808,9 +808,9 @@ func recvAndDecompress(
 
 func recv(
 	p *parser,
-	c internalencoding.BaseCodecV2,
+	c bridge.BaseCodecV2,
 	s *transport.Stream,
-	dc internalencoding.BaseDecompressorV2,
+	dc bridge.BaseDecompressorV2,
 	m any,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
@@ -822,7 +822,7 @@ func recv(
 
 	defer freeAll(msg)
 
-	err = c.Unmarshal(m, unwrapBufferSlice(msg))
+	err = c.Unmarshal(unwrapBufferSlice(msg), m)
 	if err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}
@@ -841,22 +841,18 @@ type rpcInfo struct {
 // pointers to codec, and compressors, then we can use preparedMsg for Async message prep
 // and reuse marshalled bytes
 type compressorInfo struct {
-	codec internalencoding.BaseCodecV2
-	cp    internalencoding.BaseCompressorV2
+	codec bridge.BaseCodecV2
+	cp    bridge.BaseCompressorV2
 }
 
 type rpcInfoContextKey struct{}
 
-func newCompressorV2(cp Compressor, comp encoding.Compressor) (cpV2 internalencoding.BaseCompressorV2) {
-	if cp != nil {
-		cpV2 = internalencoding.CompressorV0Bridge{Compressor: cp}
-	} else {
-		cpV2 = internalencoding.CompressorV1Bridge{Compressor: comp}
-	}
-	return cpV2
-}
-
-func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalencoding.BaseCodecV2, cp internalencoding.BaseCompressorV2) context.Context {
+func newContextWithRPCInfo(
+	ctx context.Context,
+	failfast bool,
+	codec bridge.BaseCodecV2,
+	cp bridge.BaseCompressorV2,
+) context.Context {
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{
@@ -864,6 +860,17 @@ func newContextWithRPCInfo(ctx context.Context, failfast bool, codec internalenc
 			cp:    cp,
 		},
 	})
+}
+
+func pickCompressor(cp Compressor, comp encoding.Compressor, compV2 encoding.CompressorV2) bridge.BaseCompressorV2 {
+	switch {
+	case cp != nil:
+		return bridge.CompressorV0Bridge{Compressor: cp}
+	case compV2 != nil:
+		return compV2
+	default:
+		return bridge.CompressorV1Bridge{Compressor: comp}
+	}
 }
 
 func rpcInfoFromContext(ctx context.Context) (s *rpcInfo, ok bool) {
@@ -944,12 +951,12 @@ func setCallInfoCodec(c *callInfo) error {
 
 	if c.contentSubtype == "" {
 		// No codec specified in CallOptions; use proto by default.
-		c.codec = encoding.GetCodecV2(proto.Name)
+		c.codec = bridge.GetCodec(proto.Name)
 		return nil
 	}
 
 	// c.contentSubtype is already lowercased in CallContentSubtype
-	c.codec = internalencoding.GetCodec(c.contentSubtype)
+	c.codec = bridge.GetCodec(c.contentSubtype)
 	if c.codec == nil {
 		return status.Errorf(codes.Internal, "no codec registered for content-subtype %s", c.contentSubtype)
 	}

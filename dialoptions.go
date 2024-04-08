@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/internal"
 	internalbackoff "google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/binarylog"
+	"google.golang.org/grpc/internal/bridge"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
@@ -58,8 +59,8 @@ type dialOptions struct {
 	chainUnaryInts  []UnaryClientInterceptor
 	chainStreamInts []StreamClientInterceptor
 
-	cp                          Compressor
-	dc                          Decompressor
+	cp                          bridge.BaseCompressorV2
+	dc                          bridge.BaseDecompressorV2
 	bs                          internalbackoff.Strategy
 	block                       bool
 	returnLastError             bool
@@ -229,7 +230,7 @@ func WithCodec(c Codec) DialOption {
 // Deprecated: use UseCompressor instead.  Will be supported throughout 1.x.
 func WithCompressor(cp Compressor) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
-		o.cp = cp
+		o.cp = bridge.compressorV0Bridge{Compressor: cp}
 	})
 }
 
@@ -245,7 +246,7 @@ func WithCompressor(cp Compressor) DialOption {
 // throughout 1.x.
 func WithDecompressor(dc Decompressor) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
-		o.dc = dc
+		o.dc = bridge.DecompressorV0Bridge{Decompressor: dc}
 	})
 }
 
