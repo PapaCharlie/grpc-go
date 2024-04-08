@@ -19,6 +19,7 @@
 package grpc
 
 import (
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -58,7 +59,9 @@ func (p *PreparedMsg) Encode(s Stream, msg any) error {
 		return err
 	}
 	p.encodedData = data
-	compData, err := compress(data, rpcInfo.preloaderInfo.cp)
+	// TODO: it should be possible to grab the recvBufferPool from the underlying
+	// stream implementation.
+	compData, err := compress(data, rpcInfo.preloaderInfo.cp, rpcInfo.preloaderInfo.comp, bufslice.NoopBufferProvider{})
 	if err != nil {
 		return err
 	}

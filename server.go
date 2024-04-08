@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
@@ -40,7 +41,6 @@ import (
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/binarylog"
-	"google.golang.org/grpc/internal/bridge"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpcutil"
@@ -146,9 +146,9 @@ type Server struct {
 
 type serverOptions struct {
 	creds                 credentials.TransportCredentials
-	codec                 bridge.BaseCodecV2
-	cp                    bridge.BaseCompressorV2
-	dc                    bridge.BaseDecompressorV2
+	codec                 baseCodec
+	cp                    Compressor
+	dc                    Decompressor
 	unaryInt              UnaryServerInterceptor
 	streamInt             StreamServerInterceptor
 	chainUnaryInts        []UnaryServerInterceptor
@@ -314,7 +314,7 @@ func KeepaliveEnforcementPolicy(kep keepalive.EnforcementPolicy) ServerOption {
 // Will be supported throughout 1.x.
 func CustomCodec(codec Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = bridge.CodecV1Bridge{Codec: codec}
+		o.codec = codecV1Bridge{codec: codec}
 	})
 }
 
@@ -343,7 +343,7 @@ func CustomCodec(codec Codec) ServerOption {
 // later release.
 func ForceServerCodec(codec encoding.Codec) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.codec = bridge.CodecV1Bridge{Codec: codec}
+		o.codec = codecV1Bridge{codec: codec}
 	})
 }
 
@@ -372,7 +372,7 @@ func ForceServerCodecV2(codecV2 encoding.CodecV2) ServerOption {
 // throughout 1.x.
 func RPCCompressor(cp Compressor) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.cp = bridge.compressorV0Bridge{Compressor: cp}
+		o.cp = cp
 	})
 }
 
@@ -384,7 +384,7 @@ func RPCCompressor(cp Compressor) ServerOption {
 // throughout 1.x.
 func RPCDecompressor(dc Decompressor) ServerOption {
 	return newFuncServerOption(func(o *serverOptions) {
-		o.dc = bridge.DecompressorV0Bridge{Decompressor: dc}
+		o.dc = dc
 	})
 }
 
@@ -1152,42 +1152,56 @@ func (s *Server) incrCallsFailed() {
 	s.channelz.ServerMetrics.CallsFailed.Add(1)
 }
 
-func (s *Server) sendResponse(
-	ctx context.Context,
-	t transport.ServerTransport,
-	stream *transport.Stream,
-	msg any,
-	cp bridge.BaseCompressorV2,
-	opts *transport.Options,
-) error {
-	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
+func (s *Server) sendResponse(ctx context.Context, t transport.ServerTransport, stream *transport.Stream, msg any, cp Compressor, opts *transport.Options, comp encoding.Compressor) error {
+	codec := s.getCodec(stream.ContentSubtype())
+	data, err := encode(codec, msg)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err
 	}
-	var compData [][]byte
-	if cp != nil {
-		compData, err = compress(data, cp)
-		if err != nil {
-			channelz.Error(logger, s.channelz, "grpc: server failed to compress response: ", err)
-			return err
-		}
+
+	compData, err := compress(data, cp, comp, s.opts.recvBufferPool)
+	if err != nil {
+		channelz.Error(logger, s.channelz, "grpc: server failed to compress response: ", err)
+		return err
 	}
+
 	hdr, payload := msgHeader(data, compData)
 	// TODO(dfawley): should we be checking len(data) instead?
-	if encoding.BufferSliceSize(payload) > s.opts.maxSendMessageSize {
+	if bufslice.Len(payload) > s.opts.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(payload), s.opts.maxSendMessageSize)
 	}
 
 	var materializedData, materializedPayload []byte
-	if compData != nil {
+	// Materialize the data and payload if there are any stats handlers that expect
+	// the data.
+	// TODO(PapaCharlie): This is inefficient, and stats handlers should be upgraded
+	// to support reading from the raw [][]byte instead.
+	if len(s.opts.statsHandlers) != 0 {
+		materializedData = s.opts.recvBufferPool.GetBuffer(bufslice.Len(data))
+		bufslice.WriteTo(data, materializedData)
+		defer s.opts.recvBufferPool.ReturnBuffer(materializedData)
+		if compData != nil {
+			materializedPayload = s.opts.recvBufferPool.GetBuffer(bufslice.Len(compData))
+			bufslice.WriteTo(compData, materializedPayload)
+			defer s.opts.recvBufferPool.ReturnBuffer(materializedPayload)
+		}
 	}
 
-	err = t.Write(stream, hdr, payload, opts)
+	var provider bufslice.BufferProvider
+	if compData != nil {
+		provider = s.opts.recvBufferPool
+	} else if codecProvider, ok := codec.(bufslice.BufferProvider); ok {
+		provider = codecProvider
+	} else {
+		provider = bufslice.NoopBufferProvider{}
+	}
+
+	err = t.Write(stream, hdr, bufslice.NewReader(payload, provider), opts)
 	if err == nil {
 		if len(s.opts.statsHandlers) != 0 {
 			for _, sh := range s.opts.statsHandlers {
-				sh.HandleRPC(ctx, outPayload(false, msg, data, payload, time.Now()))
+				sh.HandleRPC(ctx, outPayload(false, msg, materializedData, materializedPayload, time.Now()))
 			}
 		}
 	}
@@ -1325,17 +1339,18 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 	// decompression.  If comp and decomp are both set, they are the same;
 	// however they are kept separate to ensure that at most one of the
 	// compressor/decompressor variable pairs are set for use later.
-	var cp bridge.BaseCompressorV2
-	var dc bridge.BaseDecompressorV2
+	var comp, decomp encoding.Compressor
+	var cp Compressor
+	var dc Decompressor
 	var sendCompressorName string
 
 	// If dc is set and matches the stream's compression, use it.  Otherwise, try
 	// to find a matching registered compressor for decomp.
-	if rc := stream.RecvCompress(); s.opts.dc != nil && s.opts.dc.Name() == rc {
+	if rc := stream.RecvCompress(); s.opts.dc != nil && s.opts.dc.Type() == rc {
 		dc = s.opts.dc
 	} else if rc != "" && rc != encoding.Identity {
-		dc = bridge.GetDecompressor(rc)
-		if dc == nil {
+		decomp = encoding.GetCompressor(rc)
+		if decomp == nil {
 			st := status.Newf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", rc)
 			t.WriteStatus(stream, st)
 			return st.Err()
@@ -1348,12 +1363,12 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 	// NOTE: this needs to be ahead of all handling, https://github.com/grpc/grpc-go/issues/686.
 	if s.opts.cp != nil {
 		cp = s.opts.cp
-		sendCompressorName = cp.Name()
+		sendCompressorName = cp.Type()
 	} else if rc := stream.RecvCompress(); rc != "" && rc != encoding.Identity {
 		// Legacy compressor not specified; attempt to respond with same encoding.
-		cp = bridge.GetCompressor(rc)
-		if cp != nil {
-			sendCompressorName = cp.Name()
+		comp = encoding.GetCompressor(rc)
+		if comp != nil {
+			sendCompressorName = comp.Name()
 		}
 	}
 
@@ -1370,7 +1385,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 
 	codec := s.getCodec(stream.ContentSubtype())
 
-	d, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, codec, dc, s.opts.maxReceiveMessageSize, payInfo)
+	d, provider, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, codec, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
 	if err != nil {
 		if e := t.WriteStatus(stream, status.Convert(err)); e != nil {
 			channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
@@ -1381,21 +1396,23 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 		t.IncrMsgRecv()
 	}
 	df := func(v any) error {
-		defer freeAll(d)
+		defer bufslice.ReturnAll(d, provider)
 
-		if err := codec.Unmarshal(unwrapBufferSlice(d), v); err != nil {
+		if err := codec.Unmarshal(d, v); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
 		}
 		if len(shs) != 0 {
-			data := encoding.MaterializeBufferSlice(unwrapBufferSlice(d))
+			materializedD := s.opts.recvBufferPool.GetBuffer(bufslice.Len(d))
+			bufslice.WriteTo(d, materializedD)
+			defer s.opts.recvBufferPool.ReturnBuffer(materializedD)
 			for _, sh := range shs {
 				sh.HandleRPC(ctx, &stats.InPayload{
 					RecvTime:         time.Now(),
 					Payload:          v,
-					Length:           len(d),
+					Length:           len(materializedD),
 					WireLength:       payInfo.compressedLength + headerLen,
 					CompressedLength: payInfo.compressedLength,
-					Data:             data,
+					Data:             materializedD,
 				})
 			}
 		}
@@ -1458,9 +1475,9 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 	// Server handler could have set new compressor by calling SetSendCompressor.
 	// In case it is set, we need to use it for compressing outbound message.
 	if stream.SendCompress() != sendCompressorName {
-		cp = bridge.GetCompressor(stream.SendCompress())
+		comp = encoding.GetCompressor(stream.SendCompress())
 	}
-	if err := s.sendResponse(ctx, t, stream, reply, cp, opts); err != nil {
+	if err := s.sendResponse(ctx, t, stream, reply, cp, opts, comp); err != nil {
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).
 			return err
@@ -1664,7 +1681,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, t transport.ServerTran
 
 	// If dc is set and matches the stream's compression, use it.  Otherwise, try
 	// to find a matching registered compressor for decomp.
-	if rc := stream.RecvCompress(); s.opts.dc != nil && s.opts.dc.Name() == rc {
+	if rc := stream.RecvCompress(); s.opts.dc != nil && s.opts.dc.Type() == rc {
 		ss.dc = s.opts.dc
 	} else if rc != "" && rc != encoding.Identity {
 		ss.decomp = encoding.GetCompressor(rc)
@@ -1995,14 +2012,14 @@ func (s *Server) closeListenersLocked() {
 
 // contentSubtype must be lowercase
 // cannot return nil
-func (s *Server) getCodec(contentSubtype string) bridge.BaseCodecV2 {
+func (s *Server) getCodec(contentSubtype string) baseCodec {
 	if s.opts.codec != nil {
 		return s.opts.codec
 	}
 	if contentSubtype == "" {
 		return encoding.GetCodecV2(proto.Name)
 	}
-	codec := bridge.GetCodec(contentSubtype)
+	codec := getCodec(contentSubtype)
 	if codec == nil {
 		logger.Warningf("Unsupported codec %q. Defaulting to %q for now. This will start to fail in future releases.", contentSubtype, proto.Name)
 		return encoding.GetCodecV2(proto.Name)

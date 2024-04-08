@@ -23,6 +23,7 @@ package proto
 import (
 	"fmt"
 
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/protobuf/proto"
@@ -39,7 +40,7 @@ type codecV2 struct {
 }
 
 var _ encoding.CodecV2 = (*codecV2)(nil)
-var _ encoding.BufferProvider = (*codecV2)(nil)
+var _ bufslice.BufferProvider = (*codecV2)(nil)
 
 func (c *codecV2) Marshal(v any) ([][]byte, error) {
 	vv := messageV2Of(v)
@@ -63,9 +64,9 @@ func (c *codecV2) Unmarshal(data [][]byte, v any) (err error) {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	buf := c.GetBuffer(encoding.BufferSliceSize(data))
+	buf := c.GetBuffer(bufslice.Len(data))
 	defer c.ReturnBuffer(buf)
-	encoding.WriteBufferSlice(data, buf)
+	bufslice.WriteTo(data, buf)
 	// TODO: Upgrade proto.Unmarshal to support [][]byte
 	return proto.Unmarshal(buf, vv)
 }

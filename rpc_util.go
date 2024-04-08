@@ -29,11 +29,11 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/encoding/proto"
-	"google.golang.org/grpc/internal/bridge"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -157,7 +157,7 @@ type callInfo struct {
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
 	contentSubtype        string
-	codec                 bridge.BaseCodecV2
+	codec                 baseCodec
 	maxRetryRPCBufferSize int
 	onFinish              []func(err error)
 }
@@ -515,7 +515,7 @@ type ForceCodecCallOption struct {
 }
 
 func (o ForceCodecCallOption) before(c *callInfo) error {
-	c.codec = bridge.CodecV1Bridge{Codec: o.Codec}
+	c.codec = codecV1Bridge{codec: o.Codec}
 	return nil
 }
 func (o ForceCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -540,7 +540,7 @@ type CustomCodecCallOption struct {
 }
 
 func (o CustomCodecCallOption) before(c *callInfo) error {
-	c.codec = bridge.CodecV1Bridge{Codec: o.Codec}
+	c.codec = codecV1Bridge{codec: o.Codec}
 	return nil
 }
 func (o CustomCodecCallOption) after(c *callInfo, attempt *csAttempt) {}
@@ -611,70 +611,59 @@ type parser struct {
 // that the underlying io.Reader must not return an incompatible
 // error.
 func (p *parser) recvMsg(
-	c bridge.BaseCodecV2,
-	dc bridge.BaseDecompressorV2,
+	c baseCodec,
 	maxReceiveMessageSize int,
-) (pf payloadFormat, _ []*buffer, err error) {
+) (pf payloadFormat, out [][]byte, provider bufslice.BufferProvider, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
 	pf = payloadFormat(p.header[0])
 	length := binary.BigEndian.Uint32(p.header[1:])
 
 	if length == 0 {
-		return pf, nil, nil
+		return pf, nil, nil, nil
 	}
 	if int64(length) > int64(maxInt) {
-		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max length allowed on current machine (%d vs. %d)", length, maxInt)
+		return 0, nil, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max length allowed on current machine (%d vs. %d)", length, maxInt)
 	}
 	if int(length) > maxReceiveMessageSize {
-		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
+		return 0, nil, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
 	}
-
-	// TODO(PapaCharlie): Instead of allocating one large buffer and copying the
-	// bytes off of the wire into it, maybe this should be done at the HTTP/2 frame
-	// level directly, and the io.Reader API should be avoided.
-	var msg *buffer
 
 	// Choose the appropriate BufferProvider based on whether the message was
 	// compressed. If the message wasn't compressed it's important to use the codec's
 	// buffer provider so the codec can maximize buffer reuse.
-	var provider encoding.BufferProvider
 	if pf == compressionMade {
-		provider, _ = dc.(encoding.BufferProvider)
-	} else {
-		provider, _ = c.(encoding.BufferProvider)
-	}
-
-	// If the corresponding objects don't implement the BufferProvider interface,
-	// fall back to the configured recvBufferPool.
-	if provider == nil {
 		provider = p.recvBufferPool
-	}
-
-	msg = newBuffer(p.recvBufferPool.Get(int(length)), provider)
-
-	if _, err := p.r.Read(msg.data); err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
+	} else {
+		var ok bool
+		provider, ok = c.(bufslice.BufferProvider)
+		if !ok {
+			// If the codec doesn't implement the BufferProvider interface, fall back to the
+			// configured recvBufferPool.
+			provider = p.recvBufferPool
 		}
-		msg.free()
-		return 0, nil, err
 	}
 
-	return pf, []*buffer{msg}, nil
+	_, err = io.CopyN(bufslice.NewWriter(&out, provider), p.r, int64(length))
+	if err != nil {
+		bufslice.ReturnAll(out, provider)
+		return 0, nil, nil, err
+	}
+
+	return pf, out, provider, nil
 }
 
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c bridge.BaseCodecV2, msg any) ([][]byte, error) {
+func encode(c baseCodec, msg any) ([][]byte, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
 	data, err := c.Marshal(msg)
-	if size := encoding.BufferSliceSize(data); uint(size) > math.MaxUint32 {
+	if size := bufslice.Len(data); uint(size) > math.MaxUint32 {
 		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", size)
 	}
 
@@ -688,14 +677,47 @@ func encode(c bridge.BaseCodecV2, msg any) ([][]byte, error) {
 // compress returns the input bytes compressed by compressor or cp.
 // If both compressors are nil, or if the message has zero length, returns nil,
 // indicating no compression was done.
-func compress(in [][]byte, cp bridge.BaseCompressorV2) ([][]byte, error) {
-	if cp == nil || encoding.BufferSliceSize(in) == 0 {
+//
+// TODO(dfawley): eliminate cp parameter by wrapping Compressor in an encoding.Compressor.
+func compress(in [][]byte, cp Compressor, compressor encoding.Compressor, provider bufslice.BufferProvider) (out [][]byte, err error) {
+	if compressor == nil && cp == nil {
 		return nil, nil
 	}
-
-	out, err := cp.Compress(in)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "grpc: error while compressing: %v", err.Error())
+	if bufslice.Len(in) == 0 {
+		return nil, nil
+	}
+	defer func() {
+		if err != nil {
+			err = status.Errorf(codes.Internal, "grpc: error while compressing: %v", err.Error())
+			bufslice.ReturnAll(out, provider)
+		}
+	}()
+	w := bufslice.NewWriter(&out, provider)
+	if compressor != nil {
+		var z io.WriteCloser
+		z, err = compressor.Compress(w)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range in {
+			if _, err = z.Write(b); err != nil {
+				return nil, err
+			}
+		}
+		if err = z.Close(); err != nil {
+			return nil, err
+		}
+	} else {
+		// This is obviously really inefficient since it fully materializes the data, but
+		// there is no way around this with the old Compressor API. At least it attempts
+		// to return the buffer to the provider, in the hopes it can be reused (maybe
+		// even by a subsequent call to this very function).
+		buf := provider.GetBuffer(bufslice.Len(in))
+		defer provider.ReturnBuffer(buf)
+		bufslice.WriteTo(in, buf)
+		if err = cp.Do(w, buf); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -718,7 +740,7 @@ func msgHeader(data, compData [][]byte) (hdr []byte, payload [][]byte) {
 	}
 
 	// Write length of payload into buf
-	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(encoding.BufferSliceSize(data)))
+	binary.BigEndian.PutUint32(hdr[payloadLen:], uint32(bufslice.Len(data)))
 	return hdr, data
 }
 
@@ -752,77 +774,114 @@ func checkRecvPayload(pf payloadFormat, recvCompress string, haveCompressor bool
 
 type payloadInfo struct {
 	compressedLength  int // The compressed length got from wire.
-	uncompressedBytes []*buffer
+	uncompressedBytes [][]byte
 }
 
 // recvAndDecompress reads a message from the stream, decompressing it if necessary.
 func recvAndDecompress(
 	p *parser,
 	s *transport.Stream,
-	c bridge.BaseCodecV2,
-	dc bridge.BaseDecompressorV2,
+	c baseCodec,
+	dc Decompressor,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
-) (out []*buffer, er error) {
-	pf, compressed, err := p.recvMsg(c, dc, maxReceiveMessageSize)
+	compressor encoding.Compressor,
+) (out [][]byte, provider bufslice.BufferProvider, err error) {
+	pf, compressed, compressedProvider, err := p.recvMsg(c, maxReceiveMessageSize)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if st := checkRecvPayload(pf, s.RecvCompress(), dc != nil); st != nil {
-		freeAll(compressed)
-		return nil, st.Err()
+	compressedLength := bufslice.Len(compressed)
+
+	if st := checkRecvPayload(pf, s.RecvCompress(), compressor != nil || dc != nil); st != nil {
+		bufslice.ReturnAll(compressed, compressedProvider)
+		return nil, nil, st.Err()
 	}
 
 	if pf == compressionMade {
-		defer freeAll(compressed)
-		provider, ok := c.(encoding.BufferProvider)
+		defer bufslice.ReturnAll(compressed, compressedProvider)
+
+		var ok bool
+		provider, ok = c.(bufslice.BufferProvider)
 		if !ok {
 			provider = p.recvBufferPool
 		}
 
-		uncompressed, err := dc.Decompress(unwrapBufferSlice(compressed), provider)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
+		var uncompressed [][]byte
+		// To match legacy behavior, if the decompressor is set by WithDecompressor or RPCDecompressor,
+		// use this decompressor as the default.
+		if dc != nil {
+			var uncompressedBuf []byte
+			uncompressedBuf, err = dc.Do(bufslice.NewReader(compressed, compressedProvider))
+			uncompressed = [][]byte{uncompressedBuf}
+		} else {
+			uncompressed, err = decompress(compressor, compressed, compressedProvider, provider, maxReceiveMessageSize)
 		}
-		if size := encoding.BufferSliceSize(uncompressed); size > maxReceiveMessageSize {
+
+		if err != nil {
+			return nil, nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
+		}
+
+		if size := bufslice.Len(uncompressed); size > maxReceiveMessageSize {
 			// TODO: Revisit the error code. Currently keep it consistent with java
 			// implementation.
-			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
-		}
-		for _, b := range uncompressed {
-			out = append(out, newBuffer(b, provider))
+			return nil, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
 		}
 	} else {
 		out = compressed
+		provider = compressedProvider
 	}
 
 	if payInfo != nil {
-		payInfo.compressedLength = bufferSliceSize(compressed)
-		referenceAll(out)
+		payInfo.compressedLength = compressedLength
 		payInfo.uncompressedBytes = out
 	}
 
+	return out, provider, nil
+}
+
+// Using compressor, decompress d, returning data and size.
+// Optionally, if data will be over maxReceiveMessageSize, just return the size.
+func decompress(compressor encoding.Compressor, in [][]byte, inProvider, outProvider bufslice.BufferProvider, maxReceiveMessageSize int) ([][]byte, error) {
+	dcReader, err := compressor.Decompress(bufslice.NewReader(in, inProvider))
+	if err != nil {
+		return nil, err
+	}
+
+	var out [][]byte
+	w := bufslice.NewWriter(&out, outProvider)
+	// Read from LimitReader with limit max+1. So if the underlying
+	// reader is over limit, the result will be bigger than max.
+	_, err = w.ReadFrom(io.LimitReader(dcReader, int64(maxReceiveMessageSize)+1))
+	if err != nil {
+		bufslice.ReturnAll(out, outProvider)
+		return nil, err
+	}
 	return out, nil
 }
 
+// For the two compressor parameters, both should not be set, but if they are,
+// dc takes precedence over compressor.
+// TODO(dfawley): wrap the old compressor/decompressor using the new API?
 func recv(
 	p *parser,
-	c bridge.BaseCodecV2,
+	c baseCodec,
 	s *transport.Stream,
-	dc bridge.BaseDecompressorV2,
+	dc Decompressor,
 	m any,
 	maxReceiveMessageSize int,
 	payInfo *payloadInfo,
+	compressor encoding.Compressor,
 ) error {
-	msg, err := recvAndDecompress(p, s, c, dc, maxReceiveMessageSize, payInfo)
+	msg, provider, err := recvAndDecompress(p, s, c, dc, maxReceiveMessageSize, payInfo, compressor)
 	if err != nil {
 		return err
 	}
 
-	defer freeAll(msg)
+	defer bufslice.ReturnAll(msg, provider)
 
-	err = c.Unmarshal(unwrapBufferSlice(msg), m)
+	err = c.Unmarshal(msg, m)
 	if err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}
@@ -841,36 +900,22 @@ type rpcInfo struct {
 // pointers to codec, and compressors, then we can use preparedMsg for Async message prep
 // and reuse marshalled bytes
 type compressorInfo struct {
-	codec bridge.BaseCodecV2
-	cp    bridge.BaseCompressorV2
+	codec baseCodec
+	cp    Compressor
+	comp  encoding.Compressor
 }
 
 type rpcInfoContextKey struct{}
 
-func newContextWithRPCInfo(
-	ctx context.Context,
-	failfast bool,
-	codec bridge.BaseCodecV2,
-	cp bridge.BaseCompressorV2,
-) context.Context {
+func newContextWithRPCInfo(ctx context.Context, failfast bool, codec baseCodec, cp Compressor, comp encoding.Compressor) context.Context {
 	return context.WithValue(ctx, rpcInfoContextKey{}, &rpcInfo{
 		failfast: failfast,
 		preloaderInfo: &compressorInfo{
 			codec: codec,
 			cp:    cp,
+			comp:  comp,
 		},
 	})
-}
-
-func pickCompressor(cp Compressor, comp encoding.Compressor, compV2 encoding.CompressorV2) bridge.BaseCompressorV2 {
-	switch {
-	case cp != nil:
-		return bridge.CompressorV0Bridge{Compressor: cp}
-	case compV2 != nil:
-		return compV2
-	default:
-		return bridge.CompressorV1Bridge{Compressor: comp}
-	}
 }
 
 func rpcInfoFromContext(ctx context.Context) (s *rpcInfo, ok bool) {
@@ -951,12 +996,12 @@ func setCallInfoCodec(c *callInfo) error {
 
 	if c.contentSubtype == "" {
 		// No codec specified in CallOptions; use proto by default.
-		c.codec = bridge.GetCodec(proto.Name)
+		c.codec = getCodec(proto.Name)
 		return nil
 	}
 
 	// c.contentSubtype is already lowercased in CallContentSubtype
-	c.codec = bridge.GetCodec(c.contentSubtype)
+	c.codec = getCodec(c.contentSubtype)
 	if c.codec == nil {
 		return status.Errorf(codes.Internal, "no codec registered for content-subtype %s", c.contentSubtype)
 	}

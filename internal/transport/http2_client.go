@@ -34,6 +34,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal"
@@ -1047,7 +1048,7 @@ func (t *http2Client) GracefulClose() {
 
 // Write formats the data into HTTP2 data frame(s) and sends it out. The caller
 // should proceed only if Write returns nil.
-func (t *http2Client) Write(s *Stream, hdr []byte, data [][]byte, opts *Options) error {
+func (t *http2Client) Write(s *Stream, hdr []byte, data *bufslice.Reader, opts *Options) error {
 	if opts.Last {
 		// If it's the last message, update stream state.
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
@@ -1061,10 +1062,10 @@ func (t *http2Client) Write(s *Stream, hdr []byte, data [][]byte, opts *Options)
 		streamID:  s.id,
 		endStream: opts.Last,
 		h:         hdr,
-		d:         newBufferSliceReader(data),
+		d:         data,
 	}
 	if hdr != nil || data != nil { // If it's not an empty data frame, check quota.
-		if err := s.wq.get(int32(len(hdr) + df.d.remaining())); err != nil {
+		if err := s.wq.get(int32(len(hdr) + df.d.Len())); err != nil {
 			return err
 		}
 	}

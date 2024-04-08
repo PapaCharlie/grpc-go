@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/grpclog"
@@ -330,16 +331,14 @@ func (ht *serverHandlerTransport) writeCustomHeaders(s *Stream) {
 	s.hdrMu.Unlock()
 }
 
-func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data [][]byte, opts *Options) error {
+func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data *bufslice.Reader, opts *Options) error {
 	headersWritten := s.updateHeaderSent()
 	return ht.do(func() {
 		if !headersWritten {
 			ht.writePendingHeaders(s)
 		}
 		ht.rw.Write(hdr)
-		for _, b := range data {
-			ht.rw.Write(b)
-		}
+		_, _ = io.Copy(ht.rw, data)
 		ht.rw.(http.Flusher).Flush()
 	})
 }

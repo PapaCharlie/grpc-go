@@ -30,7 +30,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/status"
@@ -149,7 +149,7 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	h         []byte
-	d         encoding.BufferSliceReader
+	d         *bufslice.Reader
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -1007,37 +1007,4 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-type bufferSliceReader struct {
-	data     [][]byte
-	len, idx int
-}
-
-func newBufferSliceReader(data [][]byte) *bufferSliceReader {
-	return &bufferSliceReader{
-		data: data,
-		len:  encoding.BufferSliceSize(data),
-	}
-}
-
-func (r *bufferSliceReader) remaining() int {
-	return r.len - r.idx
-}
-
-func (r *bufferSliceReader) read(buf []byte) {
-	for len(buf) != 0 && r.len != 0 {
-		data := r.data[0]
-		copied := copy(buf, data[r.idx:])
-		r.len -= copied
-
-		buf = buf[copied:]
-
-		if copied == len(data) {
-			r.data = r.data[1:]
-			r.idx = 0
-		} else {
-			r.idx += copied
-		}
-	}
 }
