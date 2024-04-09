@@ -21,6 +21,7 @@ package grpc
 import (
 	"google.golang.org/grpc/bufslice"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/status"
 )
 
@@ -32,9 +33,9 @@ import (
 // later release.
 type PreparedMsg struct {
 	// Struct for preparing msg before sending them
-	encodedData [][]byte
+	encodedData *internal.RefCountedBufSlice
 	hdr         []byte
-	payload     [][]byte
+	payload     *internal.RefCountedBufSlice
 }
 
 // Encode marshalls and compresses the message using the codec and compressor for the stream.

@@ -891,23 +891,28 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp, cs.comp)
+	hdr, payload, data, err := prepareMsg(m, cs.codec, cs.cp, cs.comp, cs.cc.dopts.recvBufferPool)
 	if err != nil {
 		return err
 	}
 
+	defer data.Free()
+	if payload != data {
+		defer payload.Free()
+	}
+
 	// TODO(dfawley): should we be checking len(data) instead?
-	if bufslice.Len(payload) > *cs.callInfo.maxSendMessageSize {
-		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), *cs.callInfo.maxSendMessageSize)
+	if payload.Len() > *cs.callInfo.maxSendMessageSize {
+		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", payload.Len(), *cs.callInfo.maxSendMessageSize)
 	}
 	op := func(a *csAttempt) error {
 		return a.sendMsg(m, hdr, payload, data)
 	}
-	err = cs.withRetry(op, func() { cs.bufferForRetryLocked(len(hdr)+len(payload), op) })
+	err = cs.withRetry(op, func() { cs.bufferForRetryLocked(len(hdr)+payload.Len(), op) })
 	if len(cs.binlogs) != 0 && err == nil {
 		cm := &binarylog.ClientMessage{
 			OnClientSide: true,
-			Message:      data,
+			Message:      bufslice.Materialize(data.Data()),
 		}
 		for _, binlog := range cs.binlogs {
 			binlog.Log(cs.ctx, cm)
@@ -1034,7 +1039,7 @@ func (cs *clientStream) finish(err error) {
 	cs.cancel()
 }
 
-func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data [][]byte) error {
+func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data *internal.RefCountedBufSlice) error {
 	cs := a.cs
 	if a.trInfo != nil {
 		a.mu.Lock()
@@ -1052,8 +1057,11 @@ func (a *csAttempt) sendMsg(m any, hdr []byte, payld, data [][]byte) error {
 		}
 		return io.EOF
 	}
-	for _, sh := range a.statsHandlers {
-		sh.HandleRPC(a.ctx, outPayload(true, m, data, payld, time.Now()))
+	if len(a.statsHandlers) != 0 {
+		mData, mPayld := materializeDataAndPayload(data, payld)
+		for _, sh := range a.statsHandlers {
+			sh.HandleRPC(a.ctx, outPayload(true, m, mData, mPayld, time.Now()))
+		}
 	}
 	if channelz.IsOn() {
 		a.t.IncrMsgSent()
@@ -1065,6 +1073,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 	cs := a.cs
 	if len(a.statsHandlers) != 0 && payInfo == nil {
 		payInfo = &payloadInfo{}
+		defer payInfo.free()
 	}
 
 	if !a.decompSet {
@@ -1102,7 +1111,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		a.mu.Unlock()
 	}
 	if len(a.statsHandlers) != 0 {
-		data := bufslice.Materialize(payInfo.uncompressedBytes)
+		data := bufslice.Materialize(payInfo.uncompressedBytes.Data())
 		for _, sh := range a.statsHandlers {
 			sh.HandleRPC(a.ctx, &stats.InPayload{
 				Client:   true,
@@ -1112,7 +1121,7 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 				Data:             data,
 				WireLength:       payInfo.compressedLength + headerLen,
 				CompressedLength: payInfo.compressedLength,
-				Length:           len(payInfo.uncompressedBytes),
+				Length:           len(data),
 			})
 		}
 	}
@@ -1376,14 +1385,19 @@ func (as *addrConnStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payld, _, err := prepareMsg(m, as.codec, as.cp, as.comp)
+	hdr, payld, data, err := prepareMsg(m, as.codec, as.cp, as.comp, as.p.recvBufferPool)
 	if err != nil {
 		return err
 	}
 
+	defer data.Free()
+	if payld != data {
+		defer payld.Free()
+	}
+
 	// TODO(dfawley): should we be checking len(data) instead?
-	if len(payld) > *as.callInfo.maxSendMessageSize {
-		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payld), *as.callInfo.maxSendMessageSize)
+	if payld.Len() > *as.callInfo.maxSendMessageSize {
+		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", payld.Len(), *as.callInfo.maxSendMessageSize)
 	}
 
 	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
@@ -1648,16 +1662,21 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	}
 
 	// load hdr, payload, data
-	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp)
+	hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp, ss.p.recvBufferPool)
 	if err != nil {
 		return err
 	}
 
-	// TODO(dfawley): should we be checking len(data) instead?
-	if len(payload) > ss.maxSendMessageSize {
-		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
+	defer data.Free()
+	if data != payload {
+		defer payload.Free()
 	}
-	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
+
+	// TODO(dfawley): should we be checking len(data) instead?
+	if payload.Len() > ss.maxSendMessageSize {
+		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", payload.Len(), ss.maxSendMessageSize)
+	}
+	if err := ss.t.Write(ss.s, hdr, payload.Ref(), &transport.Options{Last: false}); err != nil {
 		return toRPCErr(err)
 	}
 	if len(ss.binlogs) != 0 {
@@ -1672,15 +1691,16 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 			}
 		}
 		sm := &binarylog.ServerMessage{
-			Message: data,
+			Message: bufslice.Materialize(data.Data()),
 		}
 		for _, binlog := range ss.binlogs {
 			binlog.Log(ss.ctx, sm)
 		}
 	}
 	if len(ss.statsHandler) != 0 {
+		mData, mPayload := materializeDataAndPayload(data, payload)
 		for _, sh := range ss.statsHandler {
-			sh.HandleRPC(ss.s.Context(), outPayload(false, m, data, payload, time.Now()))
+			sh.HandleRPC(ss.s.Context(), outPayload(false, m, mData, mPayload, time.Now()))
 		}
 	}
 	return nil
@@ -1717,6 +1737,7 @@ func (ss *serverStream) RecvMsg(m any) (err error) {
 	var payInfo *payloadInfo
 	if len(ss.statsHandler) != 0 || len(ss.binlogs) != 0 {
 		payInfo = &payloadInfo{}
+		defer payInfo.free()
 	}
 	if err := recv(ss.p, ss.codec, ss.s, ss.dc, m, ss.maxReceiveMessageSize, payInfo, ss.decomp); err != nil {
 		if err == io.EOF {
@@ -1734,13 +1755,14 @@ func (ss *serverStream) RecvMsg(m any) (err error) {
 		return toRPCErr(err)
 	}
 	if len(ss.statsHandler) != 0 {
+		data := bufslice.Materialize(payInfo.uncompressedBytes.Data())
 		for _, sh := range ss.statsHandler {
 			sh.HandleRPC(ss.s.Context(), &stats.InPayload{
 				RecvTime: time.Now(),
 				Payload:  m,
 				// TODO truncate large payload.
-				Data:             payInfo.uncompressedBytes,
-				Length:           len(payInfo.uncompressedBytes),
+				Data:             data,
+				Length:           len(data),
 				WireLength:       payInfo.compressedLength + headerLen,
 				CompressedLength: payInfo.compressedLength,
 			})
@@ -1766,7 +1788,7 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // prepareMsg returns the hdr, payload and data
 // using the compressors passed or using the
 // passed preparedmsg
-func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor) (hdr []byte, payload, data [][]byte, err error) {
+func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor, compressorProvider bufslice.BufferProvider) (hdr []byte, payload, data *internal.RefCountedBufSlice, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.payload, preparedMsg.encodedData, nil
 	}
@@ -1776,7 +1798,7 @@ func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	compData, err := compress(data, cp, comp)
+	compData, err := compress(data, cp, comp, compressorProvider)
 	if err != nil {
 		return nil, nil, nil, err
 	}

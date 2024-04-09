@@ -101,9 +101,9 @@ func Materialize(buffers [][]byte) []byte {
 }
 
 type Reader struct {
-	data     [][]byte
-	len, idx int
-	provider BufferProvider
+	data              [][]byte
+	len               int
+	dataIdx, sliceIdx int
 }
 
 func (r *Reader) Data() [][]byte {
@@ -116,18 +116,17 @@ func (r *Reader) Len() int {
 
 func (r *Reader) Read(buf []byte) (n int, _ error) {
 	for len(buf) != 0 && r.len != 0 {
-		data := r.data[0]
-		copied := copy(buf, data[r.idx:])
+		data := r.data[r.dataIdx]
+		copied := copy(buf, data[r.sliceIdx:])
 		r.len -= copied
 
 		buf = buf[copied:]
 
 		if copied == len(data) {
-			r.provider.ReturnBuffer(data)
-			r.data = r.data[1:]
-			r.idx = 0
+			r.dataIdx++
+			r.sliceIdx = 0
 		} else {
-			r.idx += copied
+			r.sliceIdx += copied
 		}
 		n += copied
 	}
@@ -139,11 +138,10 @@ func (r *Reader) Read(buf []byte) (n int, _ error) {
 	return n, nil
 }
 
-func NewReader(data [][]byte, provider BufferProvider) *Reader {
+func NewReader(data [][]byte) *Reader {
 	return &Reader{
-		data:     data,
-		len:      Len(data),
-		provider: provider,
+		data: data,
+		len:  Len(data),
 	}
 }
 

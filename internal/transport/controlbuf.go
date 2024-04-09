@@ -31,6 +31,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/bufslice"
+	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/status"
@@ -149,7 +150,8 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	h         []byte
-	d         *bufslice.Reader
+	d         *internal.RefCountedBufSlice
+	r         *bufslice.Reader
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -959,7 +961,7 @@ func (l *loopyWriter) processData() (bool, error) {
 		defer bufPool.Put(buf)
 
 		copy(buf[:hSize], dataItem.h)
-		_, _ = dataItem.d.Read(buf[hSize:])
+		_, _ = dataItem.r.Read(buf[hSize:])
 		buf = buf[:hSize+dSize]
 	}
 
@@ -984,6 +986,8 @@ func (l *loopyWriter) processData() (bool, error) {
 
 	if remainingBytes == 0 { // All the data from that message was written out.
 		str.itl.dequeue()
+		// free the buffers since they were all written out
+		dataItem.d.Free()
 	}
 	if str.itl.isEmpty() {
 		str.state = empty

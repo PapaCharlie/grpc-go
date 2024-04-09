@@ -1167,41 +1167,22 @@ func (s *Server) sendResponse(ctx context.Context, t transport.ServerTransport, 
 	}
 
 	hdr, payload := msgHeader(data, compData)
+	defer data.Free()
+	if payload != data {
+		defer payload.Free()
+	}
+
 	// TODO(dfawley): should we be checking len(data) instead?
-	if bufslice.Len(payload) > s.opts.maxSendMessageSize {
-		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(payload), s.opts.maxSendMessageSize)
+	if payload.Len() > s.opts.maxSendMessageSize {
+		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", payload.Len(), s.opts.maxSendMessageSize)
 	}
 
-	var materializedData, materializedPayload []byte
-	// Materialize the data and payload if there are any stats handlers that expect
-	// the data.
-	// TODO(PapaCharlie): This is inefficient, and stats handlers should be upgraded
-	// to support reading from the raw [][]byte instead.
-	if len(s.opts.statsHandlers) != 0 {
-		materializedData = s.opts.recvBufferPool.GetBuffer(bufslice.Len(data))
-		bufslice.WriteTo(data, materializedData)
-		defer s.opts.recvBufferPool.ReturnBuffer(materializedData)
-		if compData != nil {
-			materializedPayload = s.opts.recvBufferPool.GetBuffer(bufslice.Len(compData))
-			bufslice.WriteTo(compData, materializedPayload)
-			defer s.opts.recvBufferPool.ReturnBuffer(materializedPayload)
-		}
-	}
-
-	var provider bufslice.BufferProvider
-	if compData != nil {
-		provider = s.opts.recvBufferPool
-	} else if codecProvider, ok := codec.(bufslice.BufferProvider); ok {
-		provider = codecProvider
-	} else {
-		provider = bufslice.NoopBufferProvider{}
-	}
-
-	err = t.Write(stream, hdr, bufslice.NewReader(payload, provider), opts)
+	err = t.Write(stream, hdr, payload.Ref(), opts)
 	if err == nil {
 		if len(s.opts.statsHandlers) != 0 {
+			mData, mPayload := materializeDataAndPayload(data, payload)
 			for _, sh := range s.opts.statsHandlers {
-				sh.HandleRPC(ctx, outPayload(false, msg, materializedData, materializedPayload, time.Now()))
+				sh.HandleRPC(ctx, outPayload(false, msg, mData, mPayload, time.Now()))
 			}
 		}
 	}
@@ -1385,7 +1366,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 
 	codec := s.getCodec(stream.ContentSubtype())
 
-	d, provider, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, codec, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
+	d, err := recvAndDecompress(&parser{r: stream, recvBufferPool: s.opts.recvBufferPool}, stream, codec, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
 	if err != nil {
 		if e := t.WriteStatus(stream, status.Convert(err)); e != nil {
 			channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
@@ -1396,23 +1377,21 @@ func (s *Server) processUnaryRPC(ctx context.Context, t transport.ServerTranspor
 		t.IncrMsgRecv()
 	}
 	df := func(v any) error {
-		defer bufslice.ReturnAll(d, provider)
+		defer d.Free()
 
-		if err := codec.Unmarshal(d, v); err != nil {
+		if err := codec.Unmarshal(d.Data(), v); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
 		}
 		if len(shs) != 0 {
-			materializedD := s.opts.recvBufferPool.GetBuffer(bufslice.Len(d))
-			bufslice.WriteTo(d, materializedD)
-			defer s.opts.recvBufferPool.ReturnBuffer(materializedD)
+			mData := bufslice.Materialize(d.Data())
 			for _, sh := range shs {
 				sh.HandleRPC(ctx, &stats.InPayload{
 					RecvTime:         time.Now(),
 					Payload:          v,
-					Length:           len(materializedD),
+					Length:           len(mData),
 					WireLength:       payInfo.compressedLength + headerLen,
 					CompressedLength: payInfo.compressedLength,
-					Data:             materializedD,
+					Data:             mData,
 				})
 			}
 		}
