@@ -70,6 +70,7 @@ import (
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/test/bufconn"
 
@@ -347,10 +348,10 @@ func makeClients(bf stats.Features) ([]testgrpc.BenchmarkServiceClient, func()) 
 	}
 	switch bf.RecvBufferPool {
 	case recvBufferPoolNil:
-		// Do nothing.
+		opts = append(opts, experimental.WithBufferPool(mem.NopBufferPool{}))
+		sopts = append(sopts, experimental.BufferPool(mem.NopBufferPool{}))
 	case recvBufferPoolSimple:
-		opts = append(opts, experimental.WithRecvBufferPool(grpc.NewSharedBufferPool()))
-		sopts = append(sopts, experimental.RecvBufferPool(grpc.NewSharedBufferPool()))
+		// Do nothing as buffering is enabled by default.
 	default:
 		logger.Fatalf("Unknown shared recv buffer pool type: %v", bf.RecvBufferPool)
 	}

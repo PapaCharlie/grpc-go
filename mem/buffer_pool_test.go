@@ -16,33 +16,26 @@
  *
  */
 
-package grpc
+package mem
 
 import "testing"
 
-func (s) TestSharedBufferPool(t *testing.T) {
-	pools := []SharedBufferPool{
-		nopBufferPool{},
-		NewSharedBufferPool(),
+func TestSharedBufferPool(t *testing.T) {
+	pools := []BufferPool{
+		NopBufferPool{},
+		NewBufferPool(defaultBufferPoolSizes...),
 	}
 
-	lengths := []int{
-		level4PoolMaxSize + 1,
-		level4PoolMaxSize,
-		level3PoolMaxSize,
-		level2PoolMaxSize,
-		level1PoolMaxSize,
-		level0PoolMaxSize,
-	}
+	testSizes := append(defaultBufferPoolSizes, 1<<20+1)
 
 	for _, p := range pools {
-		for _, l := range lengths {
+		for _, l := range testSizes {
 			bs := p.Get(l)
 			if len(bs) != l {
 				t.Fatalf("Expected buffer of length %d, got %d", l, len(bs))
 			}
 
-			p.Put(&bs)
+			p.Put(bs)
 		}
 	}
 }

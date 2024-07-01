@@ -16,17 +16,80 @@
  *
  */
 
-// Package leakcheck contains functions to check leaked goroutines.
+// Package leakcheck contains functions to check leaked goroutines and buffers.
 //
 // Call "defer leakcheck.Check(t)" at the beginning of tests.
 package leakcheck
 
 import (
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
+
+	"google.golang.org/grpc/mem"
 )
+
+func SetTrackingBufferPool(efer Errorfer) {
+	mem.SetDefaultBufferPool(&trackingBufferPool{
+		pool:             mem.DefaultBufferPool(),
+		efer:             efer,
+		allocatedBuffers: make(map[*byte]string),
+	})
+}
+
+func CheckTrackingBufferPool() {
+	p := mem.DefaultBufferPool().(*trackingBufferPool)
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	mem.SetDefaultBufferPool(p.pool)
+	for b, trace := range p.allocatedBuffers {
+		p.efer.Errorf("Allocated buffer never freed %p:\n%s", b, trace)
+	}
+}
+
+type trackingBufferPool struct {
+	pool mem.BufferPool
+	efer Errorfer
+
+	lock             sync.Mutex
+	allocatedBuffers map[*byte]string
+}
+
+func (p *trackingBufferPool) Get(length int) []byte {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if length == 0 {
+		return nil
+	}
+
+	buf := p.pool.Get(length)
+
+	p.allocatedBuffers[unsafe.SliceData(buf)] = string(debug.Stack())
+
+	return buf
+}
+
+func (p *trackingBufferPool) Put(buf []byte) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if len(buf) == 0 {
+		return
+	}
+
+	key := unsafe.SliceData(buf)
+	if _, ok := p.allocatedBuffers[key]; !ok {
+		p.efer.Errorf("Unknown buffer freed:\n%s", string(debug.Stack()))
+	} else {
+		delete(p.allocatedBuffers, key)
+	}
+	p.pool.Put(buf)
+}
 
 var goroutinesToIgnore = []string{
 	"testing.Main(",
@@ -100,7 +163,10 @@ type Errorfer interface {
 	Errorf(format string, args ...any)
 }
 
-func check(efer Errorfer, timeout time.Duration) {
+// CheckGoroutines looks at the currently-running goroutines and checks if there
+// are any interesting (created by gRPC) goroutines leaked. It waits up to 10
+// seconds in the error cases.
+func CheckGoroutines(efer Errorfer, timeout time.Duration) {
 	// Loop, waiting for goroutines to shut down.
 	// Wait up to timeout, but finish as quickly as possible.
 	deadline := time.Now().Add(timeout)
@@ -114,11 +180,4 @@ func check(efer Errorfer, timeout time.Duration) {
 	for _, g := range leaked {
 		efer.Errorf("Leaked goroutine: %v", g)
 	}
-}
-
-// Check looks at the currently-running goroutines and checks if there are any
-// interesting (created by gRPC) goroutines leaked. It waits up to 10 seconds
-// in the error cases.
-func Check(efer Errorfer) {
-	check(efer, 10*time.Second)
 }
