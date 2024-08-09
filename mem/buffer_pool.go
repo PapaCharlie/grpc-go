@@ -32,7 +32,7 @@ type BufferPool interface {
 	Get(length int) []byte
 
 	// Put returns a buffer to the pool.
-	Put([]byte)
+	Put(*[]byte)
 }
 
 var defaultBufferPoolSizes = []int{
@@ -78,14 +78,6 @@ type tieredBufferPool struct {
 	fallbackPool simpleBufferPool
 }
 
-func (p *tieredBufferPool) Get(size int) []byte {
-	return p.getPool(size).Get(size)
-}
-
-func (p *tieredBufferPool) Put(buf []byte) {
-	p.getPool(cap(buf)).Put(buf)
-}
-
 func (p *tieredBufferPool) getPool(size int) BufferPool {
 	poolIdx := sort.Search(len(p.sizedPools), func(i int) bool {
 		return p.sizedPools[i].defaultSize >= size
@@ -112,20 +104,19 @@ type sizedBufferPool struct {
 }
 
 func (p *sizedBufferPool) Get(size int) []byte {
-	bs := *p.pool.Get().(*[]byte)
-	return bs[:size]
+	buf := *p.pool.Get().(*[]byte)
+	clear(buf[:cap(buf)])
+	return buf[:size]
 }
 
-func (p *sizedBufferPool) Put(buf []byte) {
-	if cap(buf) < p.defaultSize {
+func (p *sizedBufferPool) Put(buf *[]byte) {
+	if cap(*buf) < p.defaultSize {
 		// Ignore buffers that are too small to fit in the pool. Otherwise, when
 		// Get is called it will panic as it tries to index outside the bounds
 		// of the buffer.
 		return
 	}
-	buf = buf[:cap(buf)]
-	clear(buf)
-	p.pool.Put(&buf)
+	p.pool.Put(buf)
 }
 
 func newSizedBufferPool(size int) *sizedBufferPool {
@@ -165,10 +156,8 @@ func (p *simpleBufferPool) Get(size int) []byte {
 	return make([]byte, size)
 }
 
-func (p *simpleBufferPool) Put(buf []byte) {
-	buf = buf[:cap(buf)]
-	clear(buf)
-	p.pool.Put(&buf)
+func (p *simpleBufferPool) Put(buf *[]byte) {
+	p.pool.Put(buf)
 }
 
 var _ BufferPool = NopBufferPool{}
@@ -182,5 +171,5 @@ func (NopBufferPool) Get(length int) []byte {
 }
 
 // Put returns a buffer to the pool.
-func (NopBufferPool) Put([]byte) {
+func (NopBufferPool) Put(*[]byte) {
 }

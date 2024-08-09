@@ -16,17 +16,184 @@
  *
  */
 
-// Package leakcheck contains functions to check leaked goroutines.
+// Package leakcheck contains functions to check leaked goroutines and buffers.
 //
-// Call "defer leakcheck.Check(t)" at the beginning of tests.
+// Call the following at the beginning of test:
+//
+//	defer leakcheck.NewLeakChecker(t).Check()
 package leakcheck
 
 import (
 	"runtime"
+	"runtime/debug"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
+
+	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/mem"
 )
+
+func init() {
+	defaultPool := mem.DefaultBufferPool()
+	globalPool.Store(&defaultPool)
+	(internal.SetDefaultBufferPoolForTesting.(func(mem.BufferPool)))(&globalPool)
+}
+
+var globalPool swappableBufferPool
+
+type swappableBufferPool struct {
+	atomic.Pointer[mem.BufferPool]
+}
+
+func (b *swappableBufferPool) Get(length int) []byte {
+	return (*b.Load()).Get(length)
+}
+
+func (b *swappableBufferPool) Put(buf *[]byte) {
+	(*b.Load()).Put(buf)
+}
+
+// SetTrackingBufferPool upgrades the default buffer pool in the mem package to
+// one that tracks where buffers are allocated. CheckTrackingBufferPool should
+// then be invoked at the end of the test to validate that all buffers pulled
+// from the pool were returned.
+func SetTrackingBufferPool(efer Errorfer) {
+	if !mem.PoolingEnabled {
+		return
+	}
+	newPool := mem.BufferPool(&trackingBufferPool{
+		pool:             *globalPool.Load(),
+		efer:             efer,
+		allocatedBuffers: make(map[*byte][]uintptr),
+	})
+	globalPool.Store(&newPool)
+}
+
+// DisableBufferLeakCheckTestFailure disables failing the test when a buffer leak
+// is detected. Only meant to be used to disable the buffer leak checker for
+// specific tests while still leaving the checker enabled on the remaining tests.
+// Reset when CheckTrackingBufferPool is invoked.
+func DisableBufferLeakCheckTestFailure() {
+	if !mem.PoolingEnabled {
+		return
+	}
+	p := (*globalPool.Load()).(*trackingBufferPool)
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	p.disableTestFailure = true
+}
+
+// CheckTrackingBufferPool undoes the effects of SetTrackingBufferPool, and fails
+// unit tests if not all buffers were returned. It is invalid to invoke this
+// method without previously having invoked SetTrackingBufferPool.
+func CheckTrackingBufferPool() {
+	if !mem.PoolingEnabled {
+		return
+	}
+	p := (*globalPool.Load()).(*trackingBufferPool)
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	globalPool.Store(&p.pool)
+
+	type uniqueTrace struct {
+		stack []uintptr
+		count int
+	}
+
+	var uniqueTraces []uniqueTrace
+	for _, stack := range p.allocatedBuffers {
+		idx, ok := slices.BinarySearchFunc(uniqueTraces, stack, func(trace uniqueTrace, stack []uintptr) int {
+			return slices.Compare(trace.stack, stack)
+		})
+		if !ok {
+			uniqueTraces = slices.Insert(uniqueTraces, idx, uniqueTrace{stack: stack})
+		}
+		uniqueTraces[idx].count++
+	}
+
+	for _, ut := range uniqueTraces {
+		frames := runtime.CallersFrames(ut.stack)
+		var trace strings.Builder
+		for {
+			f, ok := frames.Next()
+			if !ok {
+				break
+			}
+			trace.WriteString(f.Function)
+			trace.WriteString("\n\t")
+			trace.WriteString(f.File)
+			trace.WriteString(":")
+			trace.WriteString(strconv.Itoa(f.Line))
+			trace.WriteString("\n")
+		}
+		format := "%d allocated buffers never freed:\n%s"
+		args := []any{ut.count, trace.String()}
+		if p.disableTestFailure {
+			p.efer.Logf("WARNING "+format, args...)
+		} else {
+			p.efer.Errorf(format, args...)
+		}
+	}
+}
+
+type trackingBufferPool struct {
+	pool               mem.BufferPool
+	efer               Errorfer
+	disableTestFailure bool
+
+	lock             sync.Mutex
+	allocatedBuffers map[*byte][]uintptr
+}
+
+func (p *trackingBufferPool) Get(length int) []byte {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if length == 0 {
+		return nil
+	}
+
+	buf := p.pool.Get(length)
+
+	var stackBuf [16]uintptr
+	var stack []uintptr
+	skip := 2
+	for {
+		n := runtime.Callers(skip, stackBuf[:])
+		stack = append(stack, stackBuf[:n]...)
+		if n < len(stackBuf) {
+			break
+		}
+		skip += len(stackBuf)
+	}
+	p.allocatedBuffers[unsafe.SliceData(buf)] = stack
+
+	return buf
+}
+
+func (p *trackingBufferPool) Put(buf *[]byte) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if len(*buf) == 0 {
+		return
+	}
+
+	key := unsafe.SliceData(*buf)
+	if _, ok := p.allocatedBuffers[key]; !ok {
+		p.efer.Errorf("Unknown buffer freed:\n%s", string(debug.Stack()))
+	} else {
+		delete(p.allocatedBuffers, key)
+	}
+	p.pool.Put(buf)
+}
 
 var goroutinesToIgnore = []string{
 	"testing.Main(",
@@ -94,13 +261,17 @@ func interestingGoroutines() (gs []string) {
 	return
 }
 
-// Errorfer is the interface that wraps the Errorf method. It's a subset of
-// testing.TB to make it easy to use Check.
+// Errorfer is the interface that wraps the Logf and Errorf method. It's a subset
+// of testing.TB to make it easy to use this package.
 type Errorfer interface {
+	Logf(format string, args ...any)
 	Errorf(format string, args ...any)
 }
 
-func check(efer Errorfer, timeout time.Duration) {
+// CheckGoroutines looks at the currently-running goroutines and checks if there
+// are any interesting (created by gRPC) goroutines leaked. It waits up to 10
+// seconds in the error cases.
+func CheckGoroutines(efer Errorfer, timeout time.Duration) {
 	// Loop, waiting for goroutines to shut down.
 	// Wait up to timeout, but finish as quickly as possible.
 	deadline := time.Now().Add(timeout)
@@ -116,9 +287,28 @@ func check(efer Errorfer, timeout time.Duration) {
 	}
 }
 
-// Check looks at the currently-running goroutines and checks if there are any
-// interesting (created by gRPC) goroutines leaked. It waits up to 10 seconds
-// in the error cases.
-func Check(efer Errorfer) {
-	check(efer, 10*time.Second)
+// LeakChecker captures an Errorfer and is returned by NewLeakChecker as a
+// convenient method to set up leak check tests in a unit test.
+type LeakChecker struct {
+	efer Errorfer
+}
+
+// Check executes the leak check tests, failing the unit test if any buffer or
+// goroutine leaks are detected.
+func (lc *LeakChecker) Check() {
+	CheckTrackingBufferPool()
+	CheckGoroutines(lc.efer, 10*time.Second)
+}
+
+// NewLeakChecker offers a convenient way to set up the leak checks for a
+// specific unit test. It can be used as follows, at the beginning of tests:
+//
+//	defer leakcheck.NewLeakChecker(t).Check()
+//
+// It initially invokes SetTrackingBufferPool to set up buffer tracking, then the
+// deferred LeakChecker.Check call will invoke CheckTrackingBufferPool and
+// CheckGoroutines with a default timeout of 10 seconds.
+func NewLeakChecker(efer Errorfer) *LeakChecker {
+	SetTrackingBufferPool(efer)
+	return &LeakChecker{efer: efer}
 }

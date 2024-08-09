@@ -20,6 +20,7 @@ package grpc
 
 import (
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
 )
 
@@ -31,9 +32,9 @@ import (
 // later release.
 type PreparedMsg struct {
 	// Struct for preparing msg before sending them
-	encodedData []byte
+	encodedData mem.BufferSlice
 	hdr         []byte
-	payload     []byte
+	payload     mem.BufferSlice
 }
 
 // Encode marshalls and compresses the message using the codec and compressor for the stream.
@@ -58,10 +59,15 @@ func (p *PreparedMsg) Encode(s Stream, msg any) error {
 		return err
 	}
 	p.encodedData = data
-	compData, err := compress(data, rpcInfo.preloaderInfo.cp, rpcInfo.preloaderInfo.comp)
+	// TODO: it should be possible to grab the bufferPool from the underlying
+	//  stream implementation with a type cast to its actual type (such as
+	//  addrConnStream) and accessing the buffer pool directly.
+	compData, pf, err := compress(data, rpcInfo.preloaderInfo.cp, rpcInfo.preloaderInfo.comp, mem.DefaultBufferPool())
 	if err != nil {
+		data.Free()
 		return err
 	}
-	p.hdr, p.payload = msgHeader(data, compData)
+
+	p.hdr, p.encodedData, p.payload = msgHeader(data, compData, pf)
 	return nil
 }

@@ -19,6 +19,7 @@
 package mem
 
 import (
+	"compress/flate"
 	"io"
 )
 
@@ -36,7 +37,7 @@ import (
 // By convention, any APIs that return (mem.BufferSlice, error) should reduce
 // the burden on the caller by never returning a mem.BufferSlice that needs to
 // be freed if the error is non-nil, unless explicitly stated.
-type BufferSlice []*Buffer
+type BufferSlice []Buffer
 
 // Len returns the sum of the length of all the Buffers in this slice.
 //
@@ -50,23 +51,6 @@ func (s BufferSlice) Len() int {
 		length += b.Len()
 	}
 	return length
-}
-
-// Ref returns a new BufferSlice containing a new reference of each Buffer in the
-// input slice.
-func (s BufferSlice) Ref() BufferSlice {
-	out := make(BufferSlice, len(s))
-	for i, b := range s {
-		out[i] = b.Ref()
-	}
-	return out
-}
-
-// Free invokes Buffer.Free() on each Buffer in the slice.
-func (s BufferSlice) Free() {
-	for _, b := range s {
-		b.Free()
-	}
 }
 
 // CopyTo copies each of the underlying Buffer's data into the given buffer,
@@ -97,7 +81,7 @@ func (s BufferSlice) Materialize() []byte {
 // to a single Buffer pulled from the given BufferPool. As a special case, if the
 // input BufferSlice only actually has one Buffer, this function has nothing to
 // do and simply returns said Buffer.
-func (s BufferSlice) MaterializeToBuffer(pool BufferPool) *Buffer {
+func (s BufferSlice) MaterializeToBuffer(pool BufferPool) Buffer {
 	if len(s) == 1 {
 		return s[0].Ref()
 	}
@@ -115,7 +99,10 @@ func (s BufferSlice) Reader() *Reader {
 	}
 }
 
-var _ io.ReadCloser = (*Reader)(nil)
+var _ interface {
+	io.ReadCloser
+	flate.Reader
+} = (*Reader)(nil)
 
 // Reader exposes a BufferSlice's data as an io.Reader, allowing it to interface
 // with other parts systems. It also provides an additional convenience method
@@ -144,6 +131,17 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+func (r *Reader) freeFirstBufferIfEmpty() bool {
+	if len(r.data) == 0 || r.bufferIdx != len(r.data[0].ReadOnlyData()) {
+		return false
+	}
+
+	r.data[0].Free()
+	r.data = r.data[1:]
+	r.bufferIdx = 0
+	return true
+}
+
 func (r *Reader) Read(buf []byte) (n int, _ error) {
 	if r.len == 0 {
 		return 0, io.EOF
@@ -159,17 +157,30 @@ func (r *Reader) Read(buf []byte) (n int, _ error) {
 		n += copied           // Increment the total number of bytes read.
 		buf = buf[copied:]    // Shrink the given byte slice.
 
-		// If we have copied all of the data from the first Buffer, free it and
-		// advance to the next in the slice.
-		if r.bufferIdx == len(data) {
-			oldBuffer := r.data[0]
-			oldBuffer.Free()
-			r.data = r.data[1:]
-			r.bufferIdx = 0
-		}
+		// If we have copied all the data from the first Buffer, free it and advance to
+		// the next in the slice.
+		r.freeFirstBufferIfEmpty()
 	}
 
 	return n, nil
+}
+
+func (r *Reader) ReadByte() (byte, error) {
+	if r.len == 0 {
+		return 0, io.EOF
+	}
+
+	// There may be any number of empty buffers in the slice, clear them all until a
+	// non-empty buffer is reached. This is guaranteed to exit since r.len is not 0.
+	for r.freeFirstBufferIfEmpty() {
+	}
+
+	b := r.data[0].ReadOnlyData()[r.bufferIdx]
+	r.len--
+	r.bufferIdx++
+	// Free the first buffer in the slice if the last byte was read
+	r.freeFirstBufferIfEmpty()
+	return b, nil
 }
 
 var _ io.Writer = (*writer)(nil)
